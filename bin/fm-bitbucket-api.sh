@@ -46,7 +46,7 @@ case "$API_PATH" in
   *) die 'API path must begin with /2.0/' ;;
 esac
 case "$API_PATH" in
-  *[[:space:]]*|*[[:cntrl:]]*|*'\'*|*'"'*|*'#'*) die 'invalid API path' ;;
+  *[[:space:]]*|*[[:cntrl:]]*|*\\*|*\"*|*"#"*) die 'invalid API path' ;;
 esac
 
 TOKEN=${BITBUCKET_ACCESS_TOKEN:-}
@@ -67,7 +67,7 @@ if [ -z "$TOKEN" ]; then
   exec av inject +BITBUCKET_ACCESS_TOKEN -- "$SELF" --vault-injected "$METHOD" "$API_PATH"
 fi
 case "$TOKEN" in
-  *[[:space:]]*|*[[:cntrl:]]*|*'"'*|*'\'*)
+  *[[:space:]]*|*[[:cntrl:]]*|*\"*|*\\*)
     printf 'fm-bitbucket-api: BITBUCKET_ACCESS_TOKEN has an unsafe value\n' >&2
     exit 1
     ;;

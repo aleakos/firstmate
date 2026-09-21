@@ -69,7 +69,7 @@ test_home_env_token_never_enters_arguments() {
   printf '%s\n' "BITBUCKET_ACCESS_TOKEN=$TOKEN" > "$dir/home/.env"
   printf '%s\n' '{"state":"OPEN"}' > "$dir/response.json"
 
-  out=$(FM_HOME="$dir/home" BITBUCKET_ACCESS_TOKEN= run_api "$dir" GET \
+  out=$(FM_HOME="$dir/home" BITBUCKET_ACCESS_TOKEN='' run_api "$dir" GET \
     /2.0/repositories/workspace/repository/pullrequests/7)
 
   assert_contains "$out" '"state":"OPEN"' "home .env token: API response was not relayed"
@@ -95,7 +95,7 @@ BITBUCKET_ACCESS_TOKEN="$FM_TEST_EXPECT_TOKEN" exec "$@"
 SH
   chmod +x "$dir/fakebin/av"
 
-  out=$(FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN= run_api "$dir" GET \
+  out=$(FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' run_api "$dir" GET \
     /2.0/repositories/workspace/repository)
 
   assert_contains "$out" '"uuid":"{repository}"' "vault token: API response was not relayed"
