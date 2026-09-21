@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Report the blockers this command can see on one GitHub pull request.
+# Report the blockers this command can see on one GitHub or Bitbucket Cloud
+# pull request.
 #
 # This is a one-shot, read-only command. It reads the current pull request,
-# reported checks, submitted reviews, and review decision from GitHub at
+# reported checks, and available review state from the selected provider at
 # invocation time. It never posts, requests, approves, or merges.
-# It reports on checks that have reported. A required context that has never
-# reported on this head is absent from what this command reads and cannot be
-# enumerated here. Empty output therefore means that no reported required check
+# It reports on checks that have reported. On GitHub, a required context that
+# has never reported on this head is absent from what this command reads and
+# cannot be enumerated here; advisory checks are omitted. Bitbucket Cloud's
+# status records do not declare branch-restriction requirements, so the latest
+# status for each reported key is considered and no absent requirement is
+# invented. Empty output therefore means that no check this command could read
 # is failing or pending; it does not mean the pull request is ready to merge.
-# When nothing has reported, or nothing required has, that is printed rather
-# than read as ready. Advisory checks do not block and are omitted.
+# When nothing has reported, that is printed rather than read as ready.
 # A pull request that only awaits an approval (reviewDecision REVIEW_REQUIRED)
 # is not reported as blocked. GitHub's reviewDecision owns whether reviews
 # block; review history is printed only to explain CHANGES_REQUESTED, naming
@@ -43,15 +46,75 @@ if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then
   exit 0
 fi
 [ "$#" -eq 1 ] || die "usage: fm-pr-state.sh <pr-url>"
-command -v gh >/dev/null 2>&1 || die "gh is required"
 
 URL=$1
-if ! fm_pr_url_parse "$URL" || [ "$FM_PR_PROVIDER" != github ]; then
-  die "expected a GitHub pull-request URL"
+if ! fm_pr_url_parse "$URL"; then
+  die "expected a GitHub pull-request URL or canonical Bitbucket Cloud pull-request URL"
 fi
-
+PROVIDER=$FM_PR_PROVIDER
 PATH_PART=$FM_PR_PATH
 NUMBER=$FM_PR_NUMBER
+
+bitbucket_state() {
+  local workspace repo api_path core statuses fields state draft head tasks
+  workspace=${PATH_PART%%/*}
+  repo=${PATH_PART#*/}
+  command -v jq >/dev/null 2>&1 || die "jq is required for Bitbucket Cloud"
+  api_path=$(fm_pr_bitbucket_api_path "$workspace" "$repo" "$NUMBER") \
+    || die "invalid Bitbucket Cloud pull-request identity"
+  core=$("$SCRIPT_DIR/fm-bitbucket-api.sh" GET "$api_path") \
+    || die "could not read $URL"
+  fields=$(printf '%s' "$core" | jq -r --argjson number "$NUMBER" '
+    if type == "object" and .id == $number
+      and (.state | IN("OPEN","MERGED","DECLINED","SUPERSEDED"))
+      and (.draft | type) == "boolean"
+      and (.source.commit.hash | type) == "string"
+      and (.task_count | type) == "number" then
+      "state=" + .state,
+      "draft=" + (.draft | tostring),
+      "head=" + .source.commit.hash,
+      "tasks=" + (.task_count | tostring)
+    else error("invalid pull request") end' 2>/dev/null) \
+    || die "Bitbucket Cloud returned incomplete pull-request state for $URL"
+  state=$(printf '%s\n' "$fields" | sed -n 's/^state=//p')
+  draft=$(printf '%s\n' "$fields" | sed -n 's/^draft=//p')
+  head=$(printf '%s\n' "$fields" | sed -n 's/^head=//p')
+  tasks=$(printf '%s\n' "$fields" | sed -n 's/^tasks=//p')
+  fm_pr_head_valid "$head" || die "Bitbucket Cloud returned incomplete pull-request state for $URL"
+  case "$state" in
+    MERGED) printf 'STATE: merged\n'; return 0 ;;
+    OPEN) ;;
+    *) printf 'STATE: %s\n' "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')"; return 0 ;;
+  esac
+  [ "$draft" = false ] || printf 'DRAFT: pull request is not ready for review\n'
+  [ "$tasks" -eq 0 ] || printf 'OPEN TASKS: %s unresolved task(s)\n' "$tasks"
+  statuses=$(fm_pr_bitbucket_get_paginated "$api_path/statuses?pagelen=100") \
+    || die "could not read reported checks for $URL"
+  if [ "$(printf '%s' "$statuses" | jq 'length')" -eq 0 ]; then
+    printf 'CHECKS: none reported yet\n'
+  else
+    printf '%s' "$statuses" | jq -r '
+      sort_by([.key, (.updated_on // .created_on // "")])
+      | group_by(.key)
+      | map(last)
+      | .[]
+      | select(.state != "SUCCESSFUL")
+      | "REPORTED CHECK: " + (.name // .key // "(unnamed check)") + " (" + (.state // "UNKNOWN") + ")"'
+  fi
+  printf '%s' "$core" | jq -r '
+    [.participants[]? | select(.state == "changes_requested")
+      | (.user.nickname // .user.display_name // .user.uuid // "unknown reviewer")]
+    | unique[] | "REVIEW: " + . + " CHANGES_REQUESTED"'
+}
+
+case "$PROVIDER" in
+  bitbucket) bitbucket_state; exit 0 ;;
+  github) ;;
+  *) die "fm-pr-state supports GitHub and Bitbucket Cloud pull requests" ;;
+esac
+command -v gh >/dev/null 2>&1 || die "gh is required"
+
+PATH_PART=$FM_PR_PATH
 ENDPOINT="/repos/$PATH_PART/pulls/$NUMBER"
 
 CORE=$(gh pr view "$URL" \

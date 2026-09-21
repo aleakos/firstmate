@@ -4,13 +4,14 @@
 # URLs before constructing task paths or performing any side effect.
 #
 # The stored identity is provider-tagged: provider, url, host, path, number.
-# "path" is the full project path, which is owner/repository on GitHub and an
-# arbitrarily nested group/subgroup/project namespace on GitLab. A GitLab
-# project can sit at any depth, so no owner/repository pair can address one and
-# the sidecar carries the whole path instead. GitLab also runs on self-hosted
-# instances, so the host is part of that identity rather than a constant. Every
-# consumer re-derives the identity from the stored URL and refuses any record
-# whose parts do not reconstruct that exact URL.
+# "path" is the full project path: owner/repository on GitHub,
+# workspace/repository on Bitbucket Cloud, and an arbitrarily nested
+# group/subgroup/project namespace on GitLab. A GitLab project can sit at any
+# depth, so no owner/repository pair can address one and the sidecar carries the
+# whole path instead. GitLab also runs on self-hosted instances, so the host is
+# part of that identity rather than a constant. Every consumer re-derives the
+# identity from the stored URL and refuses any record whose parts do not
+# reconstruct that exact URL.
 #
 # A validated exact merged result is retired through a private receipt only
 # after its durable wake is appended.
@@ -116,16 +117,16 @@ fm_task_id_creation_valid() {
 # GitLab serves self-hosted instances, so the host is part of the identity
 # rather than a constant. It is accepted only as a lowercase DNS name with no
 # userinfo, port, or trailing dot, which keeps one canonical spelling per MR.
-# github.com is refused here even though its shape is otherwise valid: it is
-# GitHub's own host and never a GitLab instance, so a URL like
-# https://github.com/o/r/-/merge_requests/1 (a typo'd or spoofed GitHub URL)
-# would otherwise be armed as a GitLab watch that can never succeed.
+# github.com and bitbucket.org are refused here even though their shapes are
+# otherwise valid: each is another provider's own host and never a GitLab
+# instance, so a typo'd or spoofed URL on either host cannot be armed as a
+# GitLab watch that can never succeed.
 fm_pr_gitlab_host_valid() {
   local host=${1-} label
   local LC_ALL=C
   local -a labels
   [ "${#host}" -ge 1 ] && [ "${#host}" -le 253 ] || return 1
-  [ "$host" != github.com ] || return 1
+  [ "$host" != github.com ] && [ "$host" != bitbucket.org ] || return 1
   case "$host" in
     .*|*.|*..*|*[!a-z0-9.-]*) return 1 ;;
   esac
@@ -160,15 +161,29 @@ fm_pr_gitlab_path_valid() {
   done
 }
 
+fm_pr_bitbucket_path_valid() {
+  local path=${1-} workspace repo rest
+  local LC_ALL=C
+  [ "${#path}" -ge 3 ] && [ "${#path}" -le 201 ] || return 1
+  workspace=${path%%/*}
+  rest=${path#*/}
+  [ "$rest" != "$path" ] || return 1
+  repo=$rest
+  case "$repo" in */*) return 1 ;; esac
+  [ "${#workspace}" -ge 1 ] && [ "${#workspace}" -le 100 ] || return 1
+  [ "${#repo}" -ge 1 ] && [ "${#repo}" -le 100 ] || return 1
+  case "$workspace" in -*|*-|*[!A-Za-z0-9_-]*) return 1 ;; esac
+  case "$repo" in -*|*-|*[!A-Za-z0-9_-]*) return 1 ;; esac
+}
+
 # Parse a canonical PR or MR URL into the provider-tagged identity. Validation
-# is strict and per provider: the GitHub username and repository rules are
-# unchanged, and GitLab gets its own host and namespace rules rather than a
-# loosened GitHub rule.
+# is strict and per provider: GitHub, Bitbucket Cloud, and GitLab each retain
+# their own host, route, and project-path rules.
 #
-# FM_PR_OWNER and FM_PR_REPO are additionally set for github because
-# bin/fm-pr-merge.sh addresses GitHub by owner/repository. A gitlab URL leaves
-# them empty, and that path addresses the project by FM_PR_HOST and FM_PR_PATH
-# instead, so a merge request on any instance resolves without a hardcoded host.
+# FM_PR_OWNER and FM_PR_REPO are additionally set for github and bitbucket,
+# whose API identities are both two segments. A gitlab URL leaves them empty,
+# and that path addresses the project by FM_PR_HOST and FM_PR_PATH instead, so a
+# merge request on any instance resolves without a hardcoded host.
 fm_pr_url_parse() {
   local raw=${1-} pattern host path
   local LC_ALL=C
@@ -191,6 +206,19 @@ fm_pr_url_parse() {
     # shellcheck disable=SC2034
     FM_PR_OWNER=${BASH_REMATCH[1]}
     # shellcheck disable=SC2034
+    FM_PR_REPO=${BASH_REMATCH[2]}
+    FM_PR_NUMBER=${BASH_REMATCH[3]}
+    return 0
+  fi
+  pattern='^https://bitbucket\.org/([A-Za-z0-9_-]{1,100})/([A-Za-z0-9_-]{1,100})/pull-requests/([1-9][0-9]*)$'
+  if [[ "$raw" =~ $pattern ]]; then
+    path="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    fm_pr_bitbucket_path_valid "$path" || return 1
+    FM_PR_PROVIDER=bitbucket
+    FM_PR_URL=$raw
+    FM_PR_HOST=bitbucket.org
+    FM_PR_PATH=$path
+    FM_PR_OWNER=${BASH_REMATCH[1]}
     FM_PR_REPO=${BASH_REMATCH[2]}
     FM_PR_NUMBER=${BASH_REMATCH[3]}
     return 0
@@ -226,6 +254,21 @@ fm_pr_json_draft_state() {  # <pull-request-json>
   printf '%s' "${1-}" | jq -r '
     if type == "object" and (.isDraft | type) == "boolean" then (.isDraft | tostring) else "" end
   ' 2>/dev/null || true
+}
+
+fm_pr_bitbucket_json_draft_state() {  # <pull-request-json>
+  printf '%s' "${1-}" | jq -r '
+    if type == "object" and (.draft | type) == "boolean" then (.draft | tostring) else "" end
+  ' 2>/dev/null || true
+}
+
+fm_pr_bitbucket_api_path() {  # <workspace> <repository> <number> [suffix]
+  local workspace=$1 repo=$2 number=$3 suffix=${4:-}
+  fm_pr_bitbucket_path_valid "$workspace/$repo" || return 1
+  case "$number" in ''|0|*[!0-9]*) return 1 ;; esac
+  case "$suffix" in ''|/*) ;; *) return 1 ;; esac
+  printf '/2.0/repositories/%s/%s/pullrequests/%s%s' \
+    "$workspace" "$repo" "$number" "$suffix"
 }
 
 fm_pr_file_mode() {
@@ -951,6 +994,71 @@ fm_pr_github_read_record() {  # <owner> <repo> <number>
   fi
   command -v gh-axi >/dev/null 2>&1 || return 1
   fm_pr_github_read_record_with_gh_axi "$@"
+}
+
+fm_pr_bitbucket_get_paginated() {  # <api-path>
+  local api_path=$1 json values next collected='[]' pages=0
+  command -v jq >/dev/null 2>&1 || return 1
+  while [ -n "$api_path" ]; do
+    pages=$((pages + 1))
+    [ "$pages" -le 100 ] || return 1
+    json=$("${FM_PR_BITBUCKET_API:-${BASH_SOURCE[0]%/*}/fm-bitbucket-api.sh}" GET "$api_path" 2>/dev/null) \
+      || return 1
+    values=$(printf '%s' "$json" | jq -c '
+      if type == "object" and (.values | type) == "array" then .values
+      else error("invalid paginated response") end' 2>/dev/null) || return 1
+    collected=$(jq -cn --argjson left "$collected" --argjson right "$values" '$left + $right') \
+      || return 1
+    next=$(printf '%s' "$json" | jq -r '
+      if (.next // "") == "" then ""
+      elif (.next | type) == "string" then .next
+      else error("invalid next page") end' 2>/dev/null) || return 1
+    if [ -n "$next" ]; then
+      case "$next" in
+        https://api.bitbucket.org/2.0/*) api_path=${next#https://api.bitbucket.org} ;;
+        *) return 1 ;;
+      esac
+    else
+      api_path=
+    fi
+  done
+  printf '%s\n' "$collected"
+}
+
+fm_pr_bitbucket_read_record() {  # <workspace> <repository> <number>
+  local workspace=$1 repo=$2 number=$3 api_path json fields line state=''
+  local total=0 named=0
+  FM_PR_RECORD_STATE=
+  FM_PR_RECORD_MERGED=
+  command -v jq >/dev/null 2>&1 || return 1
+  api_path=$(fm_pr_bitbucket_api_path "$workspace" "$repo" "$number") || return 1
+  if ! json=$("${FM_PR_BITBUCKET_API:-${BASH_SOURCE[0]%/*}/fm-bitbucket-api.sh}" GET "$api_path" 2>/dev/null) \
+    || [ -z "$json" ]; then
+    return 1
+  fi
+  if ! fields=$(printf '%s' "$json" | jq -r '
+      if type == "object" and (.state | type == "string")
+        and (.state | IN("OPEN","MERGED","DECLINED","SUPERSEDED")) then
+        "state=" + .state
+      else
+        error("invalid pull request state")
+      end' 2>/dev/null); then
+    return 1
+  fi
+  while IFS= read -r line; do
+    total=$((total + 1))
+    case "$line" in state=*) state=${line#state=} ;; *) continue ;; esac
+    named=$((named + 1))
+  done <<FIELDS
+$fields
+FIELDS
+  [ "$named" -eq 1 ] && [ "$total" -eq 1 ] && [ -n "$state" ] || return 1
+  FM_PR_RECORD_STATE=$state
+  if [ "$state" = MERGED ]; then
+    FM_PR_RECORD_MERGED=true
+  else
+    FM_PR_RECORD_MERGED=false
+  fi
 }
 
 fm_pr_gitlab_read_record() {  # <host> <path> <number>

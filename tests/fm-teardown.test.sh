@@ -822,6 +822,34 @@ test_no_mistakes_truly_unpushed_refuses() {
   pass "no-mistakes worktree with genuinely unlanded work is refused (safety preserved)"
 }
 
+test_bitbucket_merged_pr_allows_cleanup() {
+  local case_dir head rc
+  case_dir=$(make_case bitbucket-merged)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" bitbucket.txt landed-via-bitbucket "Bitbucket work"
+  head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  printf '%s\n' \
+    'pr=https://bitbucket.org/workspace/repository/pull-requests/7' \
+    "pr_head=$head" >> "$case_dir/state/task-x1.meta"
+  cat > "$case_dir/fakebin/curl" <<SH
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"id":7,"state":"MERGED","source":{"commit":{"hash":"$head"}}}'
+SH
+  chmod +x "$case_dir/fakebin/curl"
+
+  set +e
+  BITBUCKET_ACCESS_TOKEN=test-token run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "bitbucket-merged: cleanup should accept the exact merged pull-request head"
+  assert_no_grep 'REFUSED' "$case_dir/stderr" \
+    "bitbucket-merged: cleanup refused a confirmed merged Bitbucket pull request"
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "bitbucket-merged: cleanup left task metadata"
+  pass "cleanup verifies a Bitbucket Cloud merged pull request and its exact landed head"
+}
+
 test_squash_merged_branch_deleted_allows() {
   local case_dir rc pr_head
   case_dir=$(make_case squash-merged)
@@ -3688,6 +3716,7 @@ test_forced_teardown_retains_nested_secondmate_home_when_grandchild_close_unconf
 test_herdr_projection_teardown_retires_journal_only_after_confirmed_close
 test_herdr_projection_teardown_retains_journal_when_close_unconfirmed
 test_herdr_projection_teardown_surfaces_restore_failure_without_blocking_cleanup
+test_bitbucket_merged_pr_allows_cleanup
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

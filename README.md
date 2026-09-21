@@ -59,7 +59,7 @@ Full detail on every feature lives in [docs/architecture.md](docs/architecture.m
 ### Requirements
 
 - A verified primary agent harness: Claude Code, Grok, Pi, `pi-signed`, Oh My Pi (`omp`), Codex, OpenCode, or Cursor Agent CLI.
-- Git and the GitHub CLI, authenticated through `gh auth login`.
+- Git. For GitHub project automation, also install the GitHub CLI and authenticate with `gh auth login`; Bitbucket Cloud pull-request API operations use `BITBUCKET_ACCESS_TOKEN` instead.
 - The CLI and dependencies for your selected runtime backend; tmux is the reference default.
 
 The first mate detects and offers to install supported missing tools after you approve.
@@ -80,10 +80,14 @@ Launch it with `--trust`, or none of its project hooks load; it also has no turn
 ### Install and launch
 
 ```sh
-gh auth login
 git clone https://github.com/kunchenguid/firstmate
 cd firstmate
+# Only if this home will manage GitHub projects:
+gh auth login
 ```
+
+For Bitbucket Cloud projects, set `BITBUCKET_ACCESS_TOKEN` in the environment or this home's gitignored `.env`, or store it in Automic Vault so `av inject +BITBUCKET_ACCESS_TOKEN -- ...` can supply it on demand.
+See [Bitbucket Cloud authentication](docs/configuration.md#bitbucket-cloud-authentication) for scopes, secret handling, supported operations, and the guarded merge limitation.
 
 Then launch one of the co-primary harnesses; AGENTS.md takes over from there:
 

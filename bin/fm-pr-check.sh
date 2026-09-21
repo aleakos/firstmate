@@ -3,10 +3,11 @@
 # exact pr_head=<sha> when available, then atomically arm a static merge poll.
 # The watcher check source is byte-for-byte bin/fm-pr-poll.sh; task and PR data
 # live only in a private sidecar and are never interpolated into shell source.
-# A GitHub pull request URL and a GitLab merge request URL are both accepted,
+# Canonical GitHub, Bitbucket Cloud, and GitLab pull-request URLs are accepted,
 # including a merge request on a self-hosted GitLab instance.
-# A GitHub pull request the forge reports as a draft is refused, naming the draft
-# state and recording and arming nothing: a draft cannot be merged, so a poll armed on it
+# A GitHub or Bitbucket Cloud pull request the forge reports as a draft is
+# refused, naming the draft state and recording and arming nothing: a draft
+# cannot be merged, so a poll armed on it
 # would wait for an event that cannot occur while nobody is asked to act.
 # Mark the pull request ready for review, then arm again; a lane that keeps a
 # draft on purpose declares a wait instead of reporting done. An unreadable
@@ -68,8 +69,51 @@ if [ "$PROVIDER" = gitlab ] && ! command -v glab >/dev/null 2>&1; then
   exit 1
 fi
 
-# The draft state is read before anything is recorded or armed. Only a positive
-# draft reading refuses, because an unreadable one must not block arming.
+# Bitbucket Cloud uses the direct API for both head capture and draft state.
+# A successful validated read is required before arming because its poll is
+# intentionally silent on authentication and lookup failures.
+BITBUCKET_PR_JSON=
+BITBUCKET_HEAD=
+if [ "$PROVIDER" = bitbucket ]; then
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: watching a Bitbucket Cloud pull request requires jq on PATH" >&2
+    exit 1
+  }
+  BITBUCKET_WORKSPACE=${PROJECT_PATH%%/*}
+  BITBUCKET_REPO=${PROJECT_PATH#*/}
+  BITBUCKET_API_PATH=$(fm_pr_bitbucket_api_path "$BITBUCKET_WORKSPACE" "$BITBUCKET_REPO" "$NUMBER") || exit 1
+  if ! BITBUCKET_PR_JSON=$("$SCRIPT_DIR/fm-bitbucket-api.sh" GET "$BITBUCKET_API_PATH" 2>/dev/null) \
+    || [ -z "$BITBUCKET_PR_JSON" ]; then
+    echo "error: could not authenticate and read the Bitbucket Cloud pull request before arming merge monitoring" >&2
+    exit 1
+  fi
+  BITBUCKET_FIELDS=$(printf '%s' "$BITBUCKET_PR_JSON" | jq -r --argjson number "$NUMBER" '
+    if type == "object" and .id == $number and (.draft | type) == "boolean"
+      and (.source.commit.hash | type) == "string" then
+      "draft=" + (.draft | tostring), "head=" + .source.commit.hash
+    else error("invalid pull request") end' 2>/dev/null) || {
+      echo "error: Bitbucket Cloud returned an invalid pull request record" >&2
+      exit 1
+    }
+  BITBUCKET_DRAFT=$(printf '%s\n' "$BITBUCKET_FIELDS" | sed -n 's/^draft=//p')
+  BITBUCKET_HEAD=$(printf '%s\n' "$BITBUCKET_FIELDS" | sed -n 's/^head=//p')
+  if [ "$BITBUCKET_DRAFT" != true ] && [ "$BITBUCKET_DRAFT" != false ]; then
+    echo "error: Bitbucket Cloud returned an invalid pull request record" >&2
+    exit 1
+  fi
+  fm_pr_head_valid "$BITBUCKET_HEAD" || {
+    echo "error: Bitbucket Cloud returned an invalid pull request head" >&2
+    exit 1
+  }
+  if [ "${FM_PR_CHECK_MERGE:-}" != 1 ] && [ "$BITBUCKET_DRAFT" = true ]; then
+    echo "error: $URL is a draft pull request; a draft cannot be merged, so merge monitoring would wait for an event that cannot occur - mark it ready for review and arm again, or declare a wait instead of done if the draft is deliberate" >&2
+    exit 1
+  fi
+fi
+
+# GitHub's draft state is read before anything is recorded or armed. Only a
+# positive draft reading refuses, because an unreadable one must not block
+# arming on this existing provider path.
 if [ "$PROVIDER" = github ] && [ "${FM_PR_CHECK_MERGE:-}" != 1 ] && command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
   DRAFT_JSON=$(gh pr view "$URL" --json isDraft 2>/dev/null || true)
   if [ "$(fm_pr_json_draft_state "$DRAFT_JSON")" = true ]; then
@@ -80,9 +124,10 @@ fi
 
 "$FM_ROOT/bin/fm-guard.sh" || true
 
-# pr_head is recorded only when the forge's CLI can supply it. gh exposes the
-# head commit as a selectable field; plain glab exposes it only inside its JSON
-# output, which would need a JSON processor firstmate does not require, so a
+# pr_head is recorded when the forge surface supplies it. GitHub exposes the
+# head commit through gh and Bitbucket Cloud's API returned it in the validated
+# arming read above. Plain glab exposes it only inside JSON, which would need a
+# JSON processor firstmate does not require merely to arm a GitLab watch, so a
 # GitLab task records no pr_head. Both consumers already treat it as optional:
 # bin/fm-teardown.sh reads the head from the forge at teardown rather than from
 # metadata and falls back to its provider-agnostic content check, and
@@ -96,6 +141,8 @@ if [ "$PROVIDER" = github ] && [ -n "$WT" ] && [ -d "$WT" ] && command -v gh >/d
     && fm_pr_head_valid "$REMOTE_HEAD"; then
     PR_HEAD=$REMOTE_HEAD
   fi
+elif [ "$PROVIDER" = bitbucket ]; then
+  PR_HEAD=$BITBUCKET_HEAD
 fi
 
 META_TMP=

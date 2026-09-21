@@ -8,6 +8,7 @@
 #          Lines: "MISSING: <tool> (install: <command>)",
 #                 "PRESENTATION_UNAVAILABLE: lavish-axi (requires >=<floor>; install: <command>) - nonvisual work may proceed with plain-text decisions and reports; install or upgrade before using Lavish",
 #                 "MISSING_MANUAL: <tool> (instructions: <url>)", "NEEDS_GH_AUTH",
+#                 "NEEDS_BITBUCKET_AUTH: set BITBUCKET_ACCESS_TOKEN in the environment or .env, or make it available to Automic Vault",
 #                 "BACKEND_INVALID: <name> (known: <names>)",
 #                 "STARTUP_MEMORY_BUDGET: invalid config/startup-memory-budget - <reason>",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
@@ -904,9 +905,18 @@ missing_tool_diagnostic() {
 # Required-tool detection follows the RESOLVED backend, not a one-size default:
 # a universal toolchain every home needs plus the backend-specific delta owned by
 # fm_backend_required_tools (bin/fm-backend.sh). So a herdr/zellij/cmux home is
-# never told tmux is missing, and only orca drops treehouse. A backend value with
-# no verified dependency set is reported before the universal checks continue.
-COMMON_TOOLS="node git gh no-mistakes gh-axi chrome-devtools-axi tasks-axi quota-axi"
+# never told tmux is missing, and only orca drops treehouse. GitHub-specific gh
+# and gh-axi are required only when an origin or durable delivery record proves
+# that this home uses GitHub. A backend value with no verified dependency set is
+# reported before the universal checks continue.
+fm_detect_forge_usage "$FM_HOME/projects" "$DATA" "$STATE"
+COMMON_TOOLS="node git no-mistakes chrome-devtools-axi tasks-axi quota-axi"
+if [ "$FM_FORGE_USE_GITHUB" -eq 1 ]; then
+  COMMON_TOOLS="$COMMON_TOOLS gh gh-axi"
+fi
+if [ "$FM_FORGE_USE_BITBUCKET" -eq 1 ]; then
+  COMMON_TOOLS="$COMMON_TOOLS curl jq"
+fi
 BACKEND=$(fm_backend_name)
 BACKEND_VALID=1
 if ! BACKEND_TOOLS=$(fm_backend_required_tools "$BACKEND"); then
@@ -1479,7 +1489,8 @@ detect_local_tools() {
   if command -v no-mistakes >/dev/null 2>&1 && ! tool_version_at_least no-mistakes "$NO_MISTAKES_MIN"; then
     echo "MISSING: no-mistakes (install: $(install_cmd no-mistakes))"
   fi
-  if command -v gh-axi >/dev/null 2>&1 && ! tool_version_at_least gh-axi "$GH_AXI_MIN"; then
+  if [ "$FM_FORGE_USE_GITHUB" -eq 1 ] && command -v gh-axi >/dev/null 2>&1 \
+    && ! tool_version_at_least gh-axi "$GH_AXI_MIN"; then
     echo "MISSING: gh-axi (install: $(install_cmd gh-axi))"
   fi
   if ! tool_version_at_least lavish-axi "$LAVISH_AXI_MIN"; then
@@ -1597,8 +1608,9 @@ detect_home_summary_publication() {
 
 # The order below is the order the diagnostics have always printed in, so a
 # `skip` run is the same output with the network lines removed rather than a
-# reshuffle. `gh auth status` sits between the two local blocks because that is
-# where it has always been.
+# reshuffle. Forge authentication sits between the two local blocks because that
+# is where the GitHub probe has always been; each probe runs only for a forge
+# whose origin or durable delivery record is present in this home.
 # Each network owner below is bracketed by an elapsed-time record, so a deferred
 # stage that ran long can be attributed to the phase that spent the time.
 # fm-timing-lib.sh discards the record unless the caller asked for timings, and
@@ -1610,9 +1622,17 @@ detect_home_summary_publication() {
 # bash's dynamic scoping would let them overwrite a stamp held by a caller.
 local_phase && detect_local_tools
 if network_phase; then
-  __fm_timing_stamp=$(fm_timing_now_ms)
-  gh auth status >/dev/null 2>&1 || echo "NEEDS_GH_AUTH"
-  fm_timing_record phase gh-auth "$__fm_timing_stamp"
+  if [ "$FM_FORGE_USE_GITHUB" -eq 1 ]; then
+    __fm_timing_stamp=$(fm_timing_now_ms)
+    gh auth status >/dev/null 2>&1 || echo "NEEDS_GH_AUTH"
+    fm_timing_record phase gh-auth "$__fm_timing_stamp"
+  fi
+  if [ "$FM_FORGE_USE_BITBUCKET" -eq 1 ]; then
+    __fm_timing_stamp=$(fm_timing_now_ms)
+    "$SCRIPT_DIR/fm-bitbucket-api.sh" GET user >/dev/null 2>&1 \
+      || echo "NEEDS_BITBUCKET_AUTH: set BITBUCKET_ACCESS_TOKEN in the environment or .env, or make it available to Automic Vault"
+    fm_timing_record phase bitbucket-auth "$__fm_timing_stamp"
+  fi
 fi
 local_phase && detect_local_config
 

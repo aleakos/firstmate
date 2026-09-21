@@ -4,9 +4,11 @@
 # Pooled project clones do not keep their local default branch current, so this
 # helper compares remote-backed projects against origin/<default> after fetching
 # the default branch, and local-only projects against the local default branch.
-# When state/<id>.meta records pr= (URL or number) for an open PR, the compare
-# side is ALWAYS a freshly fetched refs/pull/<n>/head by default so review stays
-# current after no-mistakes fix rounds push to the PR. A recorded pr_head= is
+# When state/<id>.meta records pr= (URL or legacy GitHub number) for an open
+# PR, the compare side is ALWAYS a freshly fetched provider pull-request ref by
+# default so review stays current after fix rounds push to the PR. GitHub uses
+# refs/pull/<n>/head and Bitbucket Cloud uses
+# refs/pull-requests/<n>/from. A recorded pr_head= is
 # only a fallback when fetch fails (stale recorded SHAs must never win over a
 # reachable remote PR head). If neither PR head can be resolved, fall back to
 # the local branch with a warning. Without pr=, compare the local branch.
@@ -19,6 +21,8 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 "$FM_ROOT/bin/fm-guard.sh" || true
+# shellcheck source=bin/fm-pr-lib.sh
+. "$SCRIPT_DIR/fm-pr-lib.sh"
 
 usage() {
   echo "usage: fm-review-diff.sh <task-id> [--stat]" >&2
@@ -74,40 +78,45 @@ if ! git -C "$WT" rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null; th
   git -C "$WT" rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null || { echo "error: branch $BRANCH does not exist in $WT" >&2; exit 1; }
 fi
 
-pr_number_from_target() {
-  local target=$1 n
+pr_identity_from_target() {
+  local target=$1
+  REVIEW_PR_PROVIDER=
+  REVIEW_PR_NUMBER=
+  if fm_pr_url_parse "$target"; then
+    REVIEW_PR_PROVIDER=$FM_PR_PROVIDER
+    REVIEW_PR_NUMBER=$FM_PR_NUMBER
+    return 0
+  fi
   case "$target" in
-    '' ) return 1 ;;
-    *"/pull/"*)
-      n=${target##*/pull/}
-      n=${n%%[!0-9]*}
-      ;;
-    [0-9]*)
-      n=${target%%[!0-9]*}
+    [1-9]* )
+      case "$target" in *[!0-9]*) return 1 ;; esac
+      REVIEW_PR_PROVIDER=github
+      REVIEW_PR_NUMBER=$target
       ;;
     *) return 1 ;;
   esac
-  [ -n "$n" ] || return 1
-  printf '%s' "$n"
 }
 
 fetch_pull_head() {
-  local n=$1 resolved
+  local provider=$1 n=$2 source_ref private_ref resolved
   git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 1
+  case "$provider" in
+    github) source_ref="refs/pull/$n/head"; private_ref="refs/fm-review/github/$n/head" ;;
+    bitbucket) source_ref="refs/pull-requests/$n/from"; private_ref="refs/fm-review/bitbucket/$n/head" ;;
+    *) return 1 ;;
+  esac
   # Fetch into a private ref so a later base-branch fetch cannot clobber the
   # compare tip via FETCH_HEAD, and so we never review a stale local object.
-  git -C "$WT" fetch --quiet origin \
-    "+refs/pull/$n/head:refs/fm-review/pull/$n/head" >/dev/null 2>&1 || return 1
-  resolved=$(git -C "$WT" rev-parse --verify "refs/fm-review/pull/$n/head^{commit}" 2>/dev/null) || return 1
+  git -C "$WT" fetch --quiet origin "+$source_ref:$private_ref" >/dev/null 2>&1 || return 1
+  resolved=$(git -C "$WT" rev-parse --verify "$private_ref^{commit}" 2>/dev/null) || return 1
   [ -n "$resolved" ] || return 1
   printf '%s' "$resolved"
 }
 
 resolve_pr_head() {
-  local pr_url=$1 recorded_head=$2 n resolved
-  n=$(pr_number_from_target "$pr_url") || true
-  if [ -n "$n" ]; then
-    if resolved=$(fetch_pull_head "$n"); then
+  local pr_url=$1 recorded_head=$2 resolved
+  if pr_identity_from_target "$pr_url"; then
+    if resolved=$(fetch_pull_head "$REVIEW_PR_PROVIDER" "$REVIEW_PR_NUMBER"); then
       printf '%s' "$resolved"
       return 0
     fi

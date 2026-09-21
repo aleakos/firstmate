@@ -356,11 +356,14 @@ test_gh_axi_min_version() {
     [ -n "$label" ] || continue
     n=$((n + 1))
     case_dir="$TMP_ROOT/gh-axi-$n"
-    mkdir -p "$case_dir/home/config"
+    mkdir -p "$case_dir/home/config" "$case_dir/home/projects/github"
     printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+    git -C "$case_dir/home/projects/github" init -q
+    git -C "$case_dir/home/projects/github" remote add origin https://github.com/o/r.git
     fakebin=$(make_fake_toolchain "$case_dir")
     out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
-      FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_GH_AXI_VERSION="$version" "$ROOT/bin/fm-bootstrap.sh")
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_GH_AXI_VERSION="$version" FM_BOOTSTRAP_NETWORK=skip \
+      "$ROOT/bin/fm-bootstrap.sh")
     case "$mode" in
       empty)
         [ -z "$out" ] || fail "$label: expected silence, got: $out" ;;
@@ -519,6 +522,31 @@ SH
   expected="MISSING: git (install: brew install git  # or the platform's package manager)"
   [ "$out" = "$expected" ] || fail "missing git should report the supported install instruction, got: $out"
   pass "bootstrap requires git with an install instruction"
+}
+
+test_github_tools_are_required_only_for_github_homes() {
+  local case_dir fakebin curated out
+
+  case_dir="$TMP_ROOT/no-github-tools"
+  mkdir -p "$case_dir/home/config" "$case_dir/home/projects/provider"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  git -C "$case_dir/home/projects/provider" init -q
+  git -C "$case_dir/home/projects/provider" remote add origin https://bitbucket.org/workspace/repository.git
+  fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/gh" "$fakebin/gh-axi"
+  curated=$(fm_test_base_path_sans "$BASE_PATH" gh gh-axi)
+  out=$(PATH="$fakebin:$curated" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh")
+  [ -z "$out" ] || fail "a Bitbucket-only home should not require GitHub tools, got: $out"
+
+  git -C "$case_dir/home/projects/provider" remote set-url origin https://github.com/o/r.git
+  out=$(PATH="$fakebin:$curated" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'MISSING: gh (install: brew install gh' \
+    'a GitHub home must require gh'
+  assert_contains "$out" 'MISSING: gh-axi (install: npm install -g gh-axi && gh-axi setup hooks)' \
+    'a GitHub home must require gh-axi'
+  pass 'bootstrap conditions GitHub-specific tools on actual GitHub usage'
 }
 
 test_orca_backend_gates_orca_tool_only_when_selected() {
@@ -900,8 +928,9 @@ test_routine_bootstrap_contract_runs_under_system_bash() {
 test_network_phase_partitions_the_run() {
   local case_dir fakebin all_out skip_out only_out combined
   case_dir="$TMP_ROOT/network-phase"
-  mkdir -p "$case_dir/home/config"
+  mkdir -p "$case_dir/home/config" "$case_dir/home/data"
   printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' '# Backlog' '- [ ] gh - https://github.com/o/r/pull/1' > "$case_dir/home/data/backlog.md"
   fakebin=$(make_fake_toolchain "$case_dir")
   # Break the two diagnostics that stand for the two halves: a local tool floor
   # and the network GitHub-auth probe.
@@ -937,6 +966,36 @@ SH
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_BOOTSTRAP_NETWORK=sikp "$ROOT/bin/fm-bootstrap.sh")" = "$all_out" ] \
     || fail "an unrecognized FM_BOOTSTRAP_NETWORK value did not fall back to the complete run"
   pass "bootstrap: FM_BOOTSTRAP_NETWORK partitions one run into local and network halves"
+}
+
+test_bitbucket_auth_probe_is_provider_conditional() {
+  local case_dir fakebin out calls
+  case_dir="$TMP_ROOT/bitbucket-auth-probe"
+  mkdir -p "$case_dir/home/config" "$case_dir/home/data" "$case_dir/home/state"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' '# Backlog' '- [ ] bb - https://bitbucket.org/workspace/repository/pull-requests/1' \
+    > "$case_dir/home/data/backlog.md"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  calls="$case_dir/calls"
+  cat > "$fakebin/gh" <<SH
+#!/usr/bin/env bash
+printf 'gh\n' >> '$calls'
+exit 1
+SH
+  cat > "$fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 1
+SH
+  chmod +x "$fakebin/gh" "$fakebin/curl"
+  out=$(PATH="$fakebin:$BASE_PATH" BITBUCKET_ACCESS_TOKEN=test-token \
+    FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_BOOTSTRAP_NETWORK=only "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" 'NEEDS_BITBUCKET_AUTH: set BITBUCKET_ACCESS_TOKEN in the environment or .env, or make it available to Automic Vault' \
+    'an unavailable Bitbucket API must produce an actionable authentication diagnostic'
+  assert_not_contains "$out" 'NEEDS_GH_AUTH' 'a Bitbucket-only home must not probe GitHub authentication'
+  [ ! -e "$calls" ] || fail 'a Bitbucket-only home invoked gh'
+  pass 'the deferred authentication probe follows the home actual forge usage'
 }
 
 test_network_sweeps_recheck_lock_ownership() {
@@ -996,6 +1055,7 @@ test_network_phases_record_per_step_elapsed_times() {
   case_dir="$TMP_ROOT/network-timings"
   mkdir -p "$case_dir/home/config" "$case_dir/home/state" "$case_dir/home/data" "$case_dir/home/projects"
   printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' '# Backlog' '- [ ] gh - https://github.com/o/r/pull/1' > "$case_dir/home/data/backlog.md"
   printf '%s\n' $$ > "$case_dir/home/state/.lock"
   fakebin=$(make_fake_toolchain "$case_dir")
   # A real clone with a real origin, so fm-fleet-sync.sh genuinely iterates it.
@@ -1240,6 +1300,7 @@ test_lavish_axi_min_version
 test_tasks_axi_min_version
 test_quota_axi_min_version
 test_git_is_required_with_supported_install_instruction
+test_github_tools_are_required_only_for_github_homes
 test_orca_backend_gates_orca_tool_only_when_selected
 test_session_provider_backends_do_not_require_tmux
 test_session_provider_backends_gate_own_cli_not_tmux
@@ -1256,6 +1317,7 @@ test_fleet_sync_timeout_is_computed_before_launch
 test_routine_bootstrap_confirmations_are_silent
 test_routine_bootstrap_contract_runs_under_system_bash
 test_network_phase_partitions_the_run
+test_bitbucket_auth_probe_is_provider_conditional
 test_network_sweeps_recheck_lock_ownership
 test_network_phases_record_per_step_elapsed_times
 test_tasks_axi_verdict_handoff_is_consumed_once

@@ -1586,6 +1586,7 @@ test_unreachable_network_never_blocks_the_digest() {
 $rec
 EOF
   network_finished="${root%/root}/network-finished"
+  printf '%s\n' '<!-- GitHub use: https://github.com/o/r/pull/1 -->' >> "$home/data/backlog.md"
   install_slow_gh "$fakebin" 12 "$network_finished"
 
   started=$(date +%s)
@@ -1644,6 +1645,7 @@ $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
+  printf '%s\n' '<!-- GitHub use: https://github.com/o/r/pull/1 -->' >> "$home/data/backlog.md"
   printf '999999\n' > "$home/state/.lock"
   cat > "$fakebin/ps" <<'SH'
 #!/usr/bin/env bash
