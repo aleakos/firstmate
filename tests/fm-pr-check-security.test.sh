@@ -692,11 +692,27 @@ SH
 
 run_watcher_bounded() {
   local home=$1 fakebin=$2 check_interval=${FM_TEST_CHECK_INTERVAL:-0} watch_root=${FM_TEST_WATCH_ROOT:-$ROOT}
-  local check_timeout=${FM_TEST_CHECK_TIMEOUT:-1}
+  local check_timeout=${FM_TEST_CHECK_TIMEOUT:-1} watcher_timeout=${FM_TEST_WATCHER_TIMEOUT:-60}
   shift 2
-  perl -e 'my $pid=fork; die unless defined $pid; if (!$pid) { exec @ARGV } local $SIG{ALRM}=sub { kill "TERM", $pid; waitpid $pid, 0; exit 124 }; alarm 10; waitpid $pid, 0; alarm 0; exit($? >> 8)' \
-    env FM_HOME="$home" FM_ROOT_OVERRIDE="$watch_root" FM_CHECK_INTERVAL="$check_interval" FM_CHECK_TIMEOUT="$check_timeout" \
+  # These cases exercise state-check publication and retirement, not the
+  # independent inactive-outcome scan. Keep that cadence fresh so its own
+  # bounded task inventory cannot consume this check's watchdog.
+  : > "$home/state/.inactive-outcome-reconcile"
+  # This is an anti-hang bound around the whole end-to-end watcher, not a
+  # product latency assertion. The per-check FM_CHECK_TIMEOUT remains
+  # independently enforced, and every case still requires the exact expected
+  # wake before this wrapper can succeed.
+  perl -e 'my $timeout=shift; my $pid=fork; die unless defined $pid; if (!$pid) { exec @ARGV } local $SIG{ALRM}=sub { kill "TERM", $pid; waitpid $pid, 0; exit 124 }; alarm $timeout; waitpid $pid, 0; alarm 0; exit($? >> 8)' \
+    "$watcher_timeout" env FM_HOME="$home" FM_ROOT_OVERRIDE="$watch_root" FM_CHECK_INTERVAL="$check_interval" FM_CHECK_TIMEOUT="$check_timeout" \
       FM_POLL=0.02 FM_HEARTBEAT=999999 FM_SIGNAL_GRACE=0 PATH="$fakebin:$BASE_PATH" "$WATCH" "$@"
+}
+
+wait_for_path() {  # <path>: event wait, bounded only to contain a broken case
+  local path=$1 deadline=$((SECONDS + ${FM_TEST_EVENT_TIMEOUT:-60}))
+  while [ ! -e "$path" ]; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 0.02
+  done
 }
 
 test_rejected_metacharacter_bytes_are_inert() {
@@ -2414,7 +2430,7 @@ test_teardown_cannot_race_authority_consumption() {
 }
 
 test_authority_retirement_preserves_replacement() {
-  local dir state url_a url_b rc i
+  local dir state url_a url_b rc
   url_a=https://github.com/o/r/pull/1
   url_b=https://github.com/o/r/pull/2
   dir=$(make_case merge-authority-retirement-replacement)
@@ -2456,12 +2472,8 @@ SH
   rc=$?
   set -e
   [ "$rc" -eq 0 ] || fail "replacement: original poll failed: $(cat "$dir/watch-a.err")"
-  i=0
-  while [ ! -e "$dir/replacement-merge.rc" ]; do
-    sleep 0.01
-    i=$((i + 1))
-    [ "$i" -lt 200 ] || fail "replacement: serialized replacement merge did not finish"
-  done
+  wait_for_path "$dir/replacement-merge.rc" \
+    || fail "replacement: serialized replacement merge did not finish"
   [ "$(cat "$dir/replacement-merge.rc")" -eq 0 ] \
     || fail "replacement: serialized replacement merge failed: $(cat "$dir/replacement-merge.err")"
   [ -f "$state/task-a.merge-authority" ] \
@@ -2744,7 +2756,7 @@ test_device_rerecord_serializes_direct_rearm() {
 }
 
 test_device_rerecord_serializes_rerecord() {
-  local dir state original rc watcher_pid i
+  local dir state original rc watcher_pid
   dir=$(make_case device-rerecord-serialized-rerecord)
   state="$dir/home/state"
   write_poll_meta "$state" task-a https://github.com/o/r/pull/1
@@ -2772,11 +2784,8 @@ SH
     FM_TEST_GH_LOG="$dir/gh.log" FM_TEST_GH_STATE=OPEN \
     run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/watch.out" 2> "$dir/watch.err" &
   watcher_pid=$!
-  for i in $(seq 1 100); do
-    [ -d "$state/.control-task-a.lock" ] && break
-    sleep 0.02
-  done
-  [ -d "$state/.control-task-a.lock" ] || fail "watcher did not reach its device re-record"
+  wait_for_path "$state/.control-task-a.lock" \
+    || fail "watcher did not reach its device re-record"
   sleep 1
   process_is_live_non_zombie "$watcher_pid" || fail "watcher did not wait for poll publication"
   [ "$(fm_pr_sha256 "$state/task-a.pr-poll-registration")" = "$original" ] \
