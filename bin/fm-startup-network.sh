@@ -2,8 +2,9 @@
 # fm-startup-network.sh - the deferred startup stage of a session start.
 #
 # WHY THIS EXISTS. Every external-network call a session start makes used to run
-# BEFORE the digest printed, on a hook that blocks session initialization: `gh
-# auth status`, the secondmate liveness and convergence sweeps (per-secondmate
+# BEFORE the digest printed, on a hook that blocks session initialization:
+# applicable GitHub/Bitbucket Cloud authentication, the secondmate liveness and
+# convergence sweeps (per-secondmate
 # remote probes, which bootstrap runs concurrently), pending remote
 # handoff delivery, and the fleet-sync fetch of every project clone. None of
 # those calls is individually bounded, so one unreachable host could consume the
@@ -92,7 +93,8 @@
 #                             wake.
 #   .startup-network.timings  per-step elapsed times for the last run, in
 #                             bin/fm-timing-lib.sh's tab-separated format: the
-#                             stage total, one record per network phase (gh auth,
+#                             stage total, one record per network phase (the
+#                             applicable GitHub or Bitbucket Cloud auth probe,
 #                             secondmate liveness, secondmate convergence, handoff
 #                             delivery, fleet sync), one per secondmate for the
 #                             remote-touching steps (id and host), and one per
@@ -113,6 +115,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 STATUS_FILE="$STATE/.startup-network.status"
 REPORT_FILE="$STATE/.startup-network.report"
@@ -123,6 +126,9 @@ PUBLISH_LOCK="$STATE/.startup-network.lock"
 
 # shellcheck source=bin/fm-timeout-lib.sh
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
+# shellcheck source=bin/fm-env-lib.sh
+. "$SCRIPT_DIR/fm-env-lib.sh"
+fm_detect_forge_usage "$FM_HOME/projects" "$DATA" "$STATE"
 # fm-timing-lib.sh owns the per-step elapsed record this stage publishes beside
 # its report. Recording is opt-in per run: it stays inert until cmd_run points
 # FM_TIMING_LOG at a file, so nothing else that sources these scripts pays for it.
@@ -195,9 +201,17 @@ worker_alive() {
 # The exact phase names the digest and the report use, so "what has not been
 # confirmed yet" is always answerable from the status record alone.
 phase_label() {  # <phases>
+  local auth='applicable forge authentication'
+  if [ "$FM_FORGE_USE_GITHUB" -eq 1 ] && [ "$FM_FORGE_USE_BITBUCKET" -eq 1 ]; then
+    auth='GitHub and Bitbucket Cloud authentication'
+  elif [ "$FM_FORGE_USE_GITHUB" -eq 1 ]; then
+    auth='GitHub authentication'
+  elif [ "$FM_FORGE_USE_BITBUCKET" -eq 1 ]; then
+    auth='Bitbucket Cloud authentication'
+  fi
   case "$1" in
-    probe) printf 'GitHub authentication' ;;
-    probe,sweeps) printf 'GitHub authentication, dead-secondmate relaunch, secondmate convergence, pending handoff delivery, project clone refresh with its drift reporting, and inactive terminal-outcome reconciliation' ;;
+    probe) printf '%s' "$auth" ;;
+    probe,sweeps) printf '%s, dead-secondmate relaunch, secondmate convergence, pending handoff delivery, project clone refresh with its drift reporting, and inactive terminal-outcome reconciliation' "$auth" ;;
     *) printf 'the deferred network checks' ;;
   esac
 }

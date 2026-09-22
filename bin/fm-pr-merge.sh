@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Merge a task's PR or MR after recording pr= and any available pr_head= through
 # bin/fm-pr-check.sh, so teardown can verify landed work after squash merges.
-# The full canonical URL is parsed by bin/fm-pr-lib.sh. A GitHub pull request is
-# addressed through gh by the derived owner and repository; a GitLab merge
-# request is addressed through glab by the project URL rebuilt from the parsed
-# host and path, so any instance works and no host is hardcoded.
+# The full canonical URL is parsed by bin/fm-pr-lib.sh. GitHub is addressed
+# through gh, GitLab through glab, and Bitbucket Cloud through its documented
+# v2 API using the direct authenticated transport in fm-bitbucket-api.sh.
 #
 # Merge method on GitHub defaults to --squash when the caller passes none of
 # --squash, --merge, --rebase, or --method after the optional -- separator.
@@ -53,6 +52,15 @@
 # GitLab adds no method flag at all: its merge method is the project's own
 # setting, which the merge API applies, and imposing squash there would override
 # that convention rather than mirror the GitHub default.
+#
+# Bitbucket Cloud is live-checked for open, non-draft state, no unresolved
+# tasks, and green current build statuses at one exact source head. The head is
+# read again immediately before the merge boundary and a change is refused.
+# Bitbucket Cloud's documented merge endpoint has no expected-head argument
+# equivalent to GitHub --match-head-commit or GitLab --sha. A double read cannot
+# close the final request race, so this script conservatively refuses before
+# POST instead of silently weakening the exact-head safety invariant. Manual
+# merging remains visible through the same exact merged poll and cleanup proof.
 #
 # A GitLab merge is refused unless every pre-merge condition holds, each read
 # live at merge time rather than taken from recorded metadata: the merge request
@@ -177,6 +185,10 @@ if [ "${#ALLOW_RED[@]}" -gt 0 ] && [ "$PROVIDER" = gitlab ]; then
   echo "error: --allow-red does not apply to GitLab, where a merge already requires the head pipeline to have succeeded" >&2
   exit 2
 fi
+if [ "${#ALLOW_RED[@]}" -gt 0 ] && [ "$PROVIDER" = bitbucket ]; then
+  echo "error: --allow-red does not apply to Bitbucket Cloud, where build-status checks remain absolute" >&2
+  exit 2
+fi
 
 caller_has_merge_method() {
   local arg
@@ -289,6 +301,10 @@ if [ "$PROVIDER" = github ] && caller_requested_auto_merge "$@"; then
   FM_PR_GITHUB_AUTO_REQUESTED=true
 fi
 FM_PR_GITLAB_ASYNC_REQUESTED=false
+if [ "$PROVIDER" = bitbucket ] && [ "$#" -gt 0 ]; then
+  echo "error: Bitbucket Cloud merge arguments are unsupported because its merge endpoint is not called without an atomic expected-head precondition" >&2
+  exit 2
+fi
 if [ "$PROVIDER" = gitlab ]; then
   for arg in "$@"; do
     case "$arg" in
@@ -367,6 +383,17 @@ if [ "$PROVIDER" = gitlab ]; then
     exit 1
   fi
 fi
+BITBUCKET_MISSING=
+if [ "$PROVIDER" = bitbucket ]; then
+  command -v curl >/dev/null 2>&1 || BITBUCKET_MISSING="curl"
+  if ! command -v jq >/dev/null 2>&1; then
+    BITBUCKET_MISSING="${BITBUCKET_MISSING:+$BITBUCKET_MISSING and }jq"
+  fi
+  if [ -n "$BITBUCKET_MISSING" ]; then
+    echo "error: reading a Bitbucket Cloud pull request before merge requires $BITBUCKET_MISSING on PATH" >&2
+    exit 1
+  fi
+fi
 GITHUB_MISSING=
 if [ "$PROVIDER" = github ]; then
   command -v gh >/dev/null 2>&1 || GITHUB_MISSING="gh"
@@ -382,9 +409,111 @@ fi
 # The recorded head is read before bin/fm-pr-check.sh rewrites the metadata,
 # because that script re-records pr= and drops a pr_head= it cannot resolve.
 RECORDED_HEAD=
-if [ "$PROVIDER" = gitlab ]; then
+if [ "$PROVIDER" = gitlab ] || [ "$PROVIDER" = bitbucket ]; then
   RECORDED_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2- || true)
 fi
+
+bitbucket_verify_mergeable() {
+  local api_path json fields statuses line
+  local total=0 named=0 refusals=''
+  local state='' draft='' tasks='' change_requests='' live_head='' red=''
+  api_path=$(fm_pr_bitbucket_api_path "$PR_OWNER" "$PR_REPO" "$PR_NUMBER") || return 1
+  if ! json=$("$SCRIPT_DIR/fm-bitbucket-api.sh" GET "$api_path" 2>/dev/null) \
+    || [ -z "$json" ]; then
+    echo "error: could not read the Bitbucket Cloud pull request state before merging" >&2
+    return 1
+  fi
+  if ! fields=$(printf '%s' "$json" | jq -r --argjson number "$PR_NUMBER" '
+      if type == "object" and .id == $number then
+        "state=" + ((.state // "") | tostring),
+        "draft=" + (.draft | tostring),
+        "tasks=" + ((.task_count // "") | tostring),
+        "changes=" + ([.participants[]? | select(.state == "changes_requested")
+          | (.user.uuid // "unknown")] | unique | join(",")),
+        "head=" + ((.source.commit.hash // "") | tostring)
+      else error("invalid pull request") end' 2>/dev/null); then
+    echo "error: could not read the Bitbucket Cloud pull request state before merging" >&2
+    return 1
+  fi
+  while IFS= read -r line; do
+    total=$((total + 1))
+    case "$line" in
+      state=*) state=${line#state=} ;;
+      draft=*) draft=${line#draft=} ;;
+      tasks=*) tasks=${line#tasks=} ;;
+      changes=*) change_requests=${line#changes=} ;;
+      head=*) live_head=${line#head=} ;;
+      *) continue ;;
+    esac
+    named=$((named + 1))
+  done <<FIELDS
+$fields
+FIELDS
+  if [ "$named" -ne 5 ] || [ "$total" -ne 5 ] || ! fm_pr_head_valid "$live_head"; then
+    echo "error: could not read the Bitbucket Cloud pull request state before merging" >&2
+    return 1
+  fi
+  if ! statuses=$(fm_pr_bitbucket_get_paginated "$api_path/statuses?pagelen=100"); then
+    echo "error: could not read the Bitbucket Cloud build status before merging" >&2
+    return 1
+  fi
+  if ! red=$(printf '%s' "$statuses" | jq -r '
+      sort_by([.key, (.updated_on // .created_on // "")])
+      | group_by(.key) | map(last) | .[]
+      | select(.state != "SUCCESSFUL")
+      | (.name // .key // "(unnamed check)") + " (" + (.state // "UNKNOWN") + ")"' 2>/dev/null); then
+    echo "error: could not read the Bitbucket Cloud build status before merging" >&2
+    return 1
+  fi
+  [ "$state" = OPEN ] || refusals="$refusals  - state is \"${state:-unreadable}\", not open
+"
+  [ "$draft" = false ] || refusals="$refusals  - the pull request is a draft
+"
+  [ "$tasks" = 0 ] || refusals="$refusals  - unresolved task count is \"${tasks:-unreadable}\", not zero
+"
+  [ -z "$change_requests" ] || refusals="$refusals  - reviewer change requests remain from $change_requests
+"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    refusals="$refusals  - check '$line' is not green
+"
+  done <<RED
+$red
+RED
+  if [ -n "$refusals" ]; then
+    printf 'error: refusing to merge %s\n' "$URL" >&2
+    printf '%s' "$refusals" >&2
+    return 1
+  fi
+  if [ -n "$RECORDED_HEAD" ] && [ "$RECORDED_HEAD" != "$live_head" ]; then
+    printf 'notice: recorded head %s disagrees with the live head %s; verifying the live head\n' \
+      "$RECORDED_HEAD" "$live_head" >&2
+  fi
+  FM_PR_MERGE_HEAD=$live_head
+  printf 'verified: %s is open and non-draft, with no unresolved tasks and every reported check green at head %s\n' \
+    "$URL" "$live_head" >&2
+}
+
+bitbucket_recheck_head() {
+  local api_path json live_head
+  api_path=$(fm_pr_bitbucket_api_path "$PR_OWNER" "$PR_REPO" "$PR_NUMBER") || return 1
+  json=$("$SCRIPT_DIR/fm-bitbucket-api.sh" GET "$api_path" 2>/dev/null) || {
+    echo "error: could not re-read the Bitbucket Cloud pull request head before the merge boundary" >&2
+    return 1
+  }
+  live_head=$(printf '%s' "$json" | jq -r \
+    'if type == "object" and (.source.commit.hash | type) == "string" then .source.commit.hash else "" end' \
+    2>/dev/null) || live_head=
+  fm_pr_head_valid "$live_head" || {
+    echo "error: could not re-read the Bitbucket Cloud pull request head before the merge boundary" >&2
+    return 1
+  }
+  if [ "$live_head" != "$FM_PR_MERGE_HEAD" ]; then
+    printf 'error: refusing to merge %s because its head changed from %s to %s during verification\n' \
+      "$URL" "$FM_PR_MERGE_HEAD" "$live_head" >&2
+    return 1
+  fi
+}
 
 # Pre-merge conditions for a GitLab merge request, read from one live view of
 # the merge request. Sets FM_PR_MERGE_HEAD to the verified head on success and
@@ -1186,6 +1315,13 @@ case "$PROVIDER" in
       github_report_unmerged_outcome
       exit 1
     fi
+    ;;
+  bitbucket)
+    bitbucket_verify_mergeable || exit 1
+    bitbucket_recheck_head || exit 1
+    printf 'error: Bitbucket Cloud merge refused at verified head %s because its documented API has no atomic expected-head precondition; merge it on Bitbucket, and the existing merge monitor will confirm the exact landed state\n' \
+      "$FM_PR_MERGE_HEAD" >&2
+    exit 1
     ;;
   gitlab)
     gitlab_verify_mergeable || exit 1

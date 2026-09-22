@@ -1483,6 +1483,27 @@ SH
   chmod +x "$fakebin/gh"
 }
 
+# install_blocked_gh <fakebin> <release> <finished>: keep the probe outstanding
+# until the test releases it. This proves path ordering without assuming the
+# local digest can outrun a fixed sleep on every supported host.
+install_blocked_gh() {
+  local fakebin=$1 release=$2 finished=$3
+  cat > "$fakebin/gh" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = auth ]; then
+  ticks=0
+  while [ ! -e '$release' ] && [ "\$ticks" -lt 600 ]; do
+    sleep 0.1
+    ticks=\$((ticks + 1))
+  done
+  : > '$finished'
+  exit 1
+fi
+exit 0
+SH
+  chmod +x "$fakebin/gh"
+}
+
 # The locked startup scan may need the same expensive current-state read that a
 # busy validation makes slow. It belongs to the detached startup worker, so the
 # digest must finish while that read is still outstanding; the answer then has to
@@ -1580,20 +1601,24 @@ SH
 # must say so rather than implying the checks passed, and the sweeps must still
 # run and land afterwards.
 test_unreachable_network_never_blocks_the_digest() {
-  local rec root home fakebin mate log spawned network_finished out started elapsed
+  local rec root home fakebin mate log spawned world release_gate network_finished out completed_before_digest
   rec=$(prepare_session_start_secondmate secondmate-slow-network)
   IFS='|' read -r root home fakebin mate log spawned <<EOF
 $rec
 EOF
-  network_finished="${root%/root}/network-finished"
-  install_slow_gh "$fakebin" 12 "$network_finished"
+  world=${root%/root}
+  release_gate="$world/network-release"
+  network_finished="$world/network-finished"
+  printf '%s\n' '<!-- GitHub use: https://github.com/o/r/pull/1 -->' >> "$home/data/backlog.md"
+  install_blocked_gh "$fakebin" "$release_gate" "$network_finished"
 
-  started=$(date +%s)
   out=$(run_session_start_secondmate "$root" "$home" "$fakebin" "$mate" "$log" "$spawned" missing)
-  elapsed=$(( $(date +%s) - started ))
+  completed_before_digest=0
+  [ ! -e "$network_finished" ] || completed_before_digest=1
+  : > "$release_gate"
 
-  [ ! -e "$network_finished" ] \
-    || fail "the digest waited for the 12s unreachable-host probe instead of returning from local state (${elapsed}s)"
+  [ "$completed_before_digest" -eq 0 ] \
+    || fail "the digest waited for the blocked unreachable-host probe instead of returning from local state"
   assert_contains "$out" "SESSION START" "the digest did not complete"
   assert_contains "$out" "IN PROGRESS - the deferred network checks have not finished yet." \
     "the digest did not disclose that its network checks were still running"
@@ -1644,6 +1669,7 @@ $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
+  printf '%s\n' '<!-- GitHub use: https://github.com/o/r/pull/1 -->' >> "$home/data/backlog.md"
   printf '999999\n' > "$home/state/.lock"
   cat > "$fakebin/ps" <<'SH'
 #!/usr/bin/env bash

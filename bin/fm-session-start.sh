@@ -273,6 +273,8 @@ stage() {  # <stage-name>: breadcrumb for the parent's truncation banner
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
 # shellcheck source=bin/fm-session-lock-lib.sh
 . "$SCRIPT_DIR/fm-session-lock-lib.sh"
+# shellcheck source=bin/fm-env-lib.sh
+. "$SCRIPT_DIR/fm-env-lib.sh"
 
 if [ -z "${FM_SESSION_START_STAGE_FILE:-}" ]; then
   SESSION_START_BUDGET=${FM_SESSION_START_TIMEOUT:-120}
@@ -920,7 +922,7 @@ fi
 
 # --- 7. network checks ------------------------------------------------------
 # Deliberately here and not later: these lines are actionable (a stuck clone, a
-# secondmate that could not be relaunched, broken GitHub auth), and the section
+# secondmate that could not be relaunched, broken forge authentication), and the section
 # after this one is the curated memory a truncated tail is meant to take first.
 # Deliberately here and not earlier: this is the last point in the digest, so the
 # worker started at step 1 has had the whole composition above to finish in. It
@@ -929,7 +931,16 @@ fi
 stage network-checks
 section "NETWORK CHECKS"
 if [ "$READ_ONLY" -eq 1 ]; then
-  printf 'skipped (read-only session) - GitHub authentication, project clone refresh,\n'
+  fm_detect_forge_usage "$FM_HOME/projects" "$DATA" "$STATE"
+  FORGE_AUTH_LABEL='applicable forge authentication'
+  if [ "$FM_FORGE_USE_GITHUB" -eq 1 ] && [ "$FM_FORGE_USE_BITBUCKET" -eq 1 ]; then
+    FORGE_AUTH_LABEL='GitHub and Bitbucket Cloud authentication'
+  elif [ "$FM_FORGE_USE_GITHUB" -eq 1 ]; then
+    FORGE_AUTH_LABEL='GitHub authentication'
+  elif [ "$FM_FORGE_USE_BITBUCKET" -eq 1 ]; then
+    FORGE_AUTH_LABEL='Bitbucket Cloud authentication'
+  fi
+  printf 'skipped (read-only session) - %s, project clone refresh,\n' "$FORGE_AUTH_LABEL"
   printf 'secondmate liveness and convergence, and pending handoff delivery were not run.\n'
   printf 'They need the fleet lock, and this session must not spawn, steer, or merge, so it\n'
   printf 'has no action they would gate. The session holding the lock runs them.\n'

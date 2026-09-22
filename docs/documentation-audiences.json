@@ -297,6 +297,10 @@
       "audience": "maintainer-architecture"
     },
     {
+      "path": "docs/bitbucket-cloud.md",
+      "audience": "maintainer-verification"
+    },
+    {
       "path": "docs/calm-mode-feasibility.md",
       "audience": "maintainer-verification"
     },

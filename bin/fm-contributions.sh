@@ -14,7 +14,9 @@
 # Every URL explicitly linked by a structured backlog row or a task's pr= is
 # owned. Previously observed URLs remain in data/<task>/contributions.json after
 # endpoint teardown. Repository-wide PR discovery never establishes ownership.
-# GitHub PRs and issues are supported; other forges remain visibly unmeasured.
+# GitHub PRs/issues and Bitbucket Cloud pull requests are supported; GitLab and
+# Bitbucket issues remain visibly unmeasured where their review or equivalent
+# ready-for-pr semantics do not match this observer's contract.
 #
 # This script owns fm-contributions.v1: one atomic file per durable task with
 # task and records[]. Each record contains url, kind, checked_at, error,
@@ -199,6 +201,21 @@ forge() {
   return "$rc"
 }
 
+bitbucket_forge() { # relative API path
+  local remaining bounded=0 rc=0 forge_err=${FORGE_ERR:-$TMP/forge.err}
+  remaining=$((DEADLINE - $(date +%s)))
+  [ "$remaining" -gt 0 ] || { BUDGET_EXHAUSTED=1; : > "$TMP/budget-exhausted"; return 1; }
+  if [ "$remaining" -le 5 ]; then bounded=1; else remaining=5; fi
+  fm_run_timed "$remaining" "$SCRIPT_DIR/fm-bitbucket-api.sh" GET "$1" 2> "$forge_err" || rc=$?
+  if [ "$rc" -eq 124 ] && [ "$bounded" -eq 1 ]; then
+    BUDGET_EXHAUSTED=1
+    : > "$TMP/budget-exhausted"
+  elif [ "$rc" -ne 0 ]; then
+    : > "$TMP/forge-unavailable"
+  fi
+  return "$rc"
+}
+
 wait_forges() { # background forge pids from one independent read wave
   local pid rc=0
   for pid in "$@"; do wait "$pid" || rc=1; done
@@ -210,8 +227,71 @@ wait_forges() { # background forge pids from one independent read wave
   return "$rc"
 }
 
-observe() { # canonical GitHub URL -> normalized JSON
+observe_bitbucket() { # canonical Bitbucket Cloud PR URL -> normalized JSON
+  local url=$1 workspace repo number api_path head after
+  fm_pr_url_parse "$url" && [ "$FM_PR_PROVIDER" = bitbucket ] || return 1
+  workspace=$FM_PR_OWNER
+  repo=$FM_PR_REPO
+  number=$FM_PR_NUMBER
+  api_path=$(fm_pr_bitbucket_api_path "$workspace" "$repo" "$number") || return 1
+  rm -f -- "$TMP/budget-exhausted" "$TMP/forge-unavailable"
+  bitbucket_forge "$api_path" > "$TMP/core.json" || return 1
+  head=$(jq -er --argjson number "$number" '
+    select(type == "object" and .id == $number and (.state | IN("OPEN","MERGED","DECLINED","SUPERSEDED"))
+      and (.draft | type) == "boolean" and (.source.commit.hash | type) == "string")
+    | .source.commit.hash | select(test("^[a-fA-F0-9]{40}$"))' "$TMP/core.json") || return 1
+  FORGE_ERR="$TMP/comments.err" bitbucket_forge "$api_path/comments?pagelen=100" > "$TMP/comments.json" &
+  local comments_pid=$!
+  FORGE_ERR="$TMP/statuses.err" bitbucket_forge "$api_path/statuses?pagelen=100" > "$TMP/statuses.json" &
+  local statuses_pid=$!
+  wait_forges "$comments_pid" "$statuses_pid" || return 1
+  jq -e 'type == "object" and (.values | type) == "array" and (.next // null) == null' \
+    "$TMP/comments.json" "$TMP/statuses.json" >/dev/null || return 1
+  bitbucket_forge "$api_path" > "$TMP/after.json" || return 1
+  after=$(jq -er '.source.commit.hash | select(test("^[a-fA-F0-9]{40}$"))' "$TMP/after.json") || return 1
+  [ "$head" = "$after" ] || { printf 'head changed during observation\n' > "$TMP/forge.err"; return 1; }
+  jq -n --slurpfile core "$TMP/core.json" --slurpfile comments "$TMP/comments.json" \
+    --slurpfile statuses "$TMP/statuses.json" '
+    $core[0] as $c
+    | ([$c.reviewers[]?.uuid] | unique) as $reviewers
+    | ([$c.participants[]? | select(.role == "REVIEWER" and .approved == true) | .user.uuid] | unique) as $approved
+    | {head:$c.source.commit.hash,
+       state:(if $c.state == "MERGED" then "merged" elif $c.state == "OPEN" then "open" else "closed" end),
+       draft:$c.draft,
+       mergeable:"unknown",
+       can_merge:false,
+       review_decision:(if any($c.participants[]?; .state == "changes_requested") then "CHANGES_REQUESTED"
+         elif ($reviewers | length) > 0 and (($reviewers - $approved) | length) == 0 then "APPROVED"
+         elif ($reviewers | length) > 0 then "REVIEW_REQUIRED" else "" end),
+       reviews:[$c.participants[]?
+         | select(.role == "REVIEWER" and (.state == "approved" or .state == "changes_requested"))
+         | {id:(.user.uuid + ":" + (.participated_on // "")),
+            state:(if .state == "approved" then "APPROVED" else "CHANGES_REQUESTED" end),
+            commit_id:null,submitted_at:(.participated_on // ""),
+            user:{login:(.user.nickname // .user.display_name // .user.uuid)}}],
+       checks:[$statuses[0].values[]
+         | {name:(.name // .key),id:(.key + ":" + (.updated_on // .created_on // "")),
+            started_at:(.updated_on // .created_on // ""),
+            status:(if .state == "INPROGRESS" then "in_progress" else "completed" end),
+            conclusion:(if .state == "SUCCESSFUL" then "success" elif .state == "FAILED" then "failure"
+              elif .state == "STOPPED" then "cancelled" else null end)}],
+       events:[$comments[0].values[] as $comment
+         | $comment
+         | select(.deleted != true and .user.uuid != $c.author.uuid and ($reviewers | index($comment.user.uuid)) != null)
+         | {token:("comment:" + (.id|tostring) + ":" + (.updated_on // .created_on // "")),
+            type:"comment",source:(.links.html.href // $c.links.html.href),head:null,
+            author:(.user.nickname // .user.display_name // .user.uuid),body:(.content.raw // "" | .[:500])}]}' \
+    > "$TMP/observation.json" || return 1
+  jq_lib -ne --arg url "$url" --slurpfile observed "$TMP/observation.json" '
+    {schema:"fm-contributions.v1",task:"observation",records:[{url:$url,kind:"pr",pending:[],seen:[],observation:$observed[0]}]}
+    | valid_record' >/dev/null
+}
+
+observe() { # canonical supported URL -> normalized JSON
   local url=$1 part number kind endpoint head after label
+  case "$url" in
+    https://bitbucket.org/*) observe_bitbucket "$url"; return ;;
+  esac
   case "$url" in https://github.com/*) ;; *) return 1 ;; esac
   part=${url#https://github.com/}; number=${part##*/}; part=${part%/*}; kind=${part##*/}; part=${part%/*}
   case "$kind" in pull) endpoint="repos/$part/pulls/$number" ;; issues) endpoint="repos/$part/issues/$number" ;; *) return 1 ;; esac

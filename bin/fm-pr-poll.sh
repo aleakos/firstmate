@@ -4,11 +4,23 @@
 # otherwise, including on every error, so a failed lookup can never be read as
 # a merge. The provider-tagged identity is data in the sidecar and is never
 # interpolated into this source: these bytes are identical for every task.
-# Each provider is read through its own standard CLI, gh for GitHub and glab
-# for GitLab, so an upstream checkout needs no extra tooling to follow either.
+# GitHub and GitLab are read through gh and glab. Bitbucket Cloud is read
+# through Firstmate's direct API transport, which accepts an ambient
+# BITBUCKET_ACCESS_TOKEN or obtains that named secret from Automic Vault.
 set -u
 LC_ALL=C
 export LC_ALL
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BITBUCKET_API=
+if [ -x "$SCRIPT_DIR/fm-bitbucket-api.sh" ]; then
+  BITBUCKET_API="$SCRIPT_DIR/fm-bitbucket-api.sh"
+elif [ -n "${FM_ROOT_OVERRIDE:-}" ] && [ -x "$FM_ROOT_OVERRIDE/bin/fm-bitbucket-api.sh" ]; then
+  BITBUCKET_API="$FM_ROOT_OVERRIDE/bin/fm-bitbucket-api.sh"
+elif [ -n "${FM_HOME:-}" ] && [ -x "$FM_HOME/bin/fm-bitbucket-api.sh" ]; then
+  BITBUCKET_API="$FM_HOME/bin/fm-bitbucket-api.sh"
+elif [ -x "${SCRIPT_DIR%/*}/bin/fm-bitbucket-api.sh" ]; then
+  BITBUCKET_API="${SCRIPT_DIR%/*}/bin/fm-bitbucket-api.sh"
+fi
 
 if [ "$#" -eq 6 ] && [ "$1" = --validated ]; then
   provider=$2
@@ -65,9 +77,29 @@ case "$provider" in
     state=$(gh pr view "$url" --json state -q .state 2>/dev/null) || exit 0
     [ "$state" = MERGED ] && printf '%s\n' merged
     ;;
+  bitbucket)
+    [ "$host" = bitbucket.org ] || exit 0
+    workspace=${path%%/*}
+    repo=${path#*/}
+    [ "$repo" != "$path" ] || exit 0
+    case "$repo" in */*) exit 0 ;; esac
+    [ "${#workspace}" -ge 1 ] && [ "${#workspace}" -le 100 ] || exit 0
+    [ "${#repo}" -ge 1 ] && [ "${#repo}" -le 100 ] || exit 0
+    case "$workspace" in -*|*-|*[!A-Za-z0-9_-]*) exit 0 ;; esac
+    case "$repo" in -*|*-|*[!A-Za-z0-9_-]*) exit 0 ;; esac
+    [ "$url" = "https://bitbucket.org/$workspace/$repo/pull-requests/$number" ] || exit 0
+    command -v jq >/dev/null 2>&1 || exit 0
+    [ -n "$BITBUCKET_API" ] || exit 0
+    api_path="/2.0/repositories/$workspace/$repo/pullrequests/$number"
+    json=$("$BITBUCKET_API" GET "$api_path" 2>/dev/null) || exit 0
+    state=$(printf '%s' "$json" | jq -r \
+      'if type == "object" and (.state | type == "string") then .state else "" end' \
+      2>/dev/null) || exit 0
+    [ "$state" = MERGED ] && printf '%s\n' merged
+    ;;
   gitlab)
     [ "${#host}" -ge 1 ] && [ "${#host}" -le 253 ] || exit 0
-    [ "$host" != github.com ] || exit 0
+    [ "$host" != github.com ] && [ "$host" != bitbucket.org ] || exit 0
     case "$host" in
       .*|*.|*..*|*[!a-z0-9.-]*) exit 0 ;;
     esac

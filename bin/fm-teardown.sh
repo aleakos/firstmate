@@ -1332,11 +1332,22 @@ pr_number_from_target() {
 }
 
 ensure_commit_object() {
-  local target=$1 commit=$2 n
+  local target=$1 commit=$2 n provider=github source_ref
   git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null && return 0
-  n=$(pr_number_from_target "$target") || return 1
+  if fm_pr_url_parse "$target"; then
+    provider=$FM_PR_PROVIDER
+    n=$FM_PR_NUMBER
+  else
+    n=$(pr_number_from_target "$target") || return 1
+  fi
+  case "$provider" in
+    github) source_ref="refs/pull/$n/head" ;;
+    gitlab) source_ref="refs/merge-requests/$n/head" ;;
+    bitbucket) source_ref="refs/pull-requests/$n/from" ;;
+    *) return 1 ;;
+  esac
   git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 1
-  git -C "$WT" fetch --quiet origin "refs/pull/$n/head" >/dev/null 2>&1 || return 1
+  git -C "$WT" fetch --quiet origin "$source_ref" >/dev/null 2>&1 || return 1
   git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null
 }
 
@@ -1372,44 +1383,61 @@ $unpushed
 EOF
 }
 
-# Is the worktree's PR merged for local work contained in that PR? Resolves the
-# PR from the recorded pr= URL first, then from the branch name, and asks GitHub
-# for both the PR state and head. Returns non-zero when the PR is not merged, the
-# current work is not contained in the PR head, no PR is found, or any gh error
-# occurs - the caller then falls back to the content check.
-pr_is_merged() {
-  local branch=$1 target view state remainder head resolved_url current landed=0
-  if [ -n "$PR_URL" ]; then
-    target=$PR_URL
-  else
-    target=$(pr_number_from_branch "$branch") || return 1
-  fi
-  [ -n "$target" ] || return 1
-  view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid,url -q '.state + "\t" + .headRefOid + "\t" + .url' 2>/dev/null) || return 1
-  state=${view%%$'\t'*}
-  remainder=${view#*$'\t'}
-  [ "$state" != "$view" ] || return 1
-  head=${remainder%%$'\t'*}
-  resolved_url=${remainder#*$'\t'}
-  [ "$head" != "$remainder" ] || return 1
-  case "$state" in
-    MERGED|merged) ;;
-    *) return 1 ;;
-  esac
-  [ -n "$head" ] || return 1
+pr_head_contains_local_work() {  # <target> <head>
+  local target=$1 head=$2 current
   ensure_commit_object "$target" "$head" || return 1
   current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
-  if git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null; then
-    landed=1
-  elif unpushed_patches_are_in_pr_head "$head"; then
-    landed=1
+  git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null \
+    || unpushed_patches_are_in_pr_head "$head"
+}
+
+# Is the worktree's PR merged for local work contained in that PR? A canonical
+# recorded URL selects its provider. The legacy branch-discovery fallback stays
+# GitHub-only; Bitbucket Cloud ready registration records the canonical URL and
+# exact head before cleanup can run. Any unreadable or non-merged provider state
+# falls through to the provider-agnostic content check below.
+pr_is_merged() {
+  local branch=$1 target view state remainder head resolved_url api_path json provider
+  if [ -n "$PR_URL" ]; then
+    target=$PR_URL
+    fm_pr_url_parse "$target" || return 1
+    provider=$FM_PR_PROVIDER
+  else
+    target=$(pr_number_from_branch "$branch") || return 1
+    provider=github
   fi
-  [ "$landed" = 1 ] || return 1
-  if [ -z "$PR_URL" ]; then
-    [ -n "$resolved_url" ] || return 1
-    PR_URL=$resolved_url
-  fi
-  return 0
+  [ -n "$target" ] || return 1
+  case "$provider" in
+    github)
+      view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid,url -q '.state + "\t" + .headRefOid + "\t" + .url' 2>/dev/null) || return 1
+      state=${view%%$'\t'*}
+      remainder=${view#*$'\t'}
+      [ "$state" != "$view" ] || return 1
+      head=${remainder%%$'\t'*}
+      resolved_url=${remainder#*$'\t'}
+      [ "$head" != "$remainder" ] || return 1
+      case "$state" in MERGED|merged) ;; *) return 1 ;; esac
+      fm_pr_head_valid "$head" || return 1
+      pr_head_contains_local_work "$target" "$head" || return 1
+      if [ -z "$PR_URL" ]; then
+        [ -n "$resolved_url" ] || return 1
+        PR_URL=$resolved_url
+      fi
+      ;;
+    bitbucket)
+      api_path=$(fm_pr_bitbucket_api_path "$FM_PR_OWNER" "$FM_PR_REPO" "$FM_PR_NUMBER") || return 1
+      json=$("$SCRIPT_DIR/fm-bitbucket-api.sh" GET "$api_path" 2>/dev/null) || return 1
+      state=$(printf '%s' "$json" | jq -r \
+        'if type == "object" and (.state | type) == "string" then .state else "" end' \
+        2>/dev/null) || return 1
+      head=$(printf '%s' "$json" | jq -r \
+        'if type == "object" and (.source.commit.hash | type) == "string" then .source.commit.hash else "" end' \
+        2>/dev/null) || return 1
+      [ "$state" = MERGED ] && fm_pr_head_valid "$head" || return 1
+      pr_head_contains_local_work "$target" "$head" || return 1
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 # Is the branch's content already present in the up-to-date default branch? Fetches

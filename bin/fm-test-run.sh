@@ -376,7 +376,7 @@ family_for_basename() {
     fm-teardown-endpoint-safety.test.sh)
       printf '%s\n' backend-dispatch
       ;;
-    fm-check-unregister.test.sh|fm-pr-check-security.test.sh|fm-pr-merge.test.sh|\
+    fm-bitbucket-cloud.test.sh|fm-check-unregister.test.sh|fm-pr-check-security.test.sh|fm-pr-merge.test.sh|\
     fm-pr-reviewers.test.sh|fm-pr-state.test.sh|\
     fm-review-diff.test.sh|fm-teardown.test.sh|fm-x-mode.test.sh)
       printf '%s\n' pr-forge
@@ -686,6 +686,7 @@ tests/fm-bearings-board-lavish-live-e2e.test.sh 48
 tests/fm-bearings-board-render.test.sh 12591
 tests/fm-bearings-board.test.sh 36490
 tests/fm-bearings-snapshot.test.sh 171176
+tests/fm-bitbucket-cloud.test.sh 125000
 tests/fm-bootstrap-network-parallel.test.sh 9539
 tests/fm-bootstrap.test.sh 46634
 tests/fm-branch-supervision.test.sh 8915

@@ -547,15 +547,40 @@ The resolver sends the key to `curl` only as a header read from a file descripto
 The resolver fixes the endpoint at `https://api.typesafe.ai`, model at `jev-latest`, confidence floor at 0.6, and request timeout at 5 seconds; `TYPESAFE_API_KEY` is its only resolver-specific environment setting.
 The live rule-match evidence is recorded in [`verification/dispatch-resolve.md`](verification/dispatch-resolve.md).
 
+## Bitbucket Cloud authentication
+
+Bitbucket Cloud pull requests use the documented `https://api.bitbucket.org/2.0` API through [`bin/fm-bitbucket-api.sh`](../bin/fm-bitbucket-api.sh).
+Set `BITBUCKET_ACCESS_TOKEN` in the process environment or this firstmate home's gitignored `.env`.
+The environment wins.
+If neither source contains the token and `av` is available, the helper runs itself through `av inject +BITBUCKET_ACCESS_TOKEN -- ...`, allowing Automic Vault to provide the value without copying it into firstmate state.
+Grant the token read access to the repositories, pull requests, comments, tasks, and commit/build statuses this home will supervise.
+Use the narrowest repository or workspace scope that covers those reads.
+This token authenticates Firstmate's Bitbucket API reads; configure SSH or HTTPS Git credentials separately for clone, fetch, push, and pull-request branch refs.
+
+The helper never puts the token in command arguments, repository files, state, or output.
+It supplies the `Authorization: Bearer` header to `curl` through standard-input configuration and fixes requests to Bitbucket Cloud's HTTPS API host.
+A home with a Bitbucket origin or durable Bitbucket pull-request URL checks this credential during the deferred startup network stage.
+Failure reports `NEEDS_BITBUCKET_AUTH` with the three supported credential sources.
+A home with no Bitbucket evidence makes no Bitbucket API request.
+
+Firstmate supports canonical `https://bitbucket.org/<workspace>/<repository>/pull-requests/<number>` URLs for readiness registration, exact merged-state monitoring, current-state and blocker reads, review-diff head resolution, cleanup verification, and contribution follow-up.
+The contribution observer reads up to 100 comments and build statuses and treats a paginated result beyond that bound as unavailable rather than silently claiming complete coverage.
+Bitbucket Cloud's documented merge endpoint does not expose an atomic expected-source-commit precondition equivalent to GitHub's `--match-head-commit` or GitLab's `--sha`.
+`fm-pr-merge.sh` therefore performs two exact head reads but refuses before submitting a Bitbucket merge, leaving merge monitoring armed; it never weakens the invariant by merging a head that could change between verification and submission.
+Merge the pull request in Bitbucket, then the existing monitor verifies the exact `MERGED` state and normal cleanup continues.
+See [`docs/bitbucket-cloud.md`](bitbucket-cloud.md) for the maintainer-facing parity and verification record.
+
 ## Toolchain
 
 On session start the first mate detects what its required toolchain is missing or too old and lists each problem with either an exact install command or manual instructions.
 It installs automatically supported tools only after you say go; manual-only tools remain for you to install from the printed instructions.
 Required tools come in two parts: a universal toolchain every home needs regardless of backend, and a per-backend delta that follows the runtime backend actually resolved for this home.
-The essential universal toolchain is node, git, gh with GitHub auth via `gh auth login`, no-mistakes v1.46.0 or newer, compatible gh-axi, chrome-devtools-axi, compatible tasks-axi per "Backlog backend" above, and compatible quota-axi.
+The essential universal toolchain is node, git, no-mistakes v1.46.0 or newer, chrome-devtools-axi, compatible tasks-axi per "Backlog backend" above, and compatible quota-axi.
+GitHub homes additionally require `gh`, GitHub authentication via `gh auth login`, and compatible `gh-axi`; those GitHub-specific tools are not required when no project origin or durable delivery record in the home uses GitHub.
+Bitbucket Cloud homes additionally require `curl` and `jq` plus the credential contract above, without requiring GitHub tools solely for Bitbucket work.
 [`bin/fm-bootstrap.sh`](../bin/fm-bootstrap.sh) owns the axi-family floor policy and the gh-axi and lavish-axi floors, while [`bin/fm-tasks-axi-lib.sh`](../bin/fm-tasks-axi-lib.sh) and [`bin/fm-quota-axi-lib.sh`](../bin/fm-quota-axi-lib.sh) hold their own tools' floor constants.
 This section is the single owner of that universal toolchain list; backend guides' prerequisites point here and add only their backend-specific tools.
-In that list, no-mistakes runs the validation pipeline, gh-axi and chrome-devtools-axi cover GitHub and browser operations, and tasks-axi plus quota-axi back backlog mutations and quota-aware array dispatch.
+In that list, no-mistakes runs the validation pipeline, chrome-devtools-axi covers browser operations, optional `gh-axi` covers GitHub operations, and tasks-axi plus quota-axi back backlog mutations and quota-aware array dispatch.
 Lavish is a presentation-only dependency for visual decisions and reports; nonvisual work can proceed with plain text when it is unavailable.
 The per-backend delta is required only for the backend resolved from `FM_BACKEND`, then `config/backend`, then runtime auto-detection, then default `tmux`, so a home is never told to install a tool an inactive backend or feature would need.
 That delta is owned in code by `fm_backend_required_tools` in `bin/fm-backend.sh`: the resolved backend's own session-provider CLI (`tmux`, `herdr`, `zellij`, `orca`, or `cmux`), `jq` for the JSON-emitting adapters (`herdr`, `zellij`, `cmux`) whose spawn and liveness paths parse the backend's JSON output, and the `treehouse` worktree provider for every session-provider-only backend (`tmux`, `herdr`, `zellij`, `cmux`).
@@ -567,7 +592,7 @@ When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispat
 When Relay is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
 `tasks-axi` and `quota-axi` are essential bootstrap tools in every profile.
 An absent or incompatible `tasks-axi` reports `MISSING: tasks-axi (install: npm install -g tasks-axi)`; when `config/backlog-backend` is not `manual`, a home with a configured non-markdown adapter or a markdown backlog refuses lifecycle mutation until compatible `tasks-axi` is on `PATH`, while a manual-backend home keeps its backlog hand-edited.
-An absent or incompatible `gh-axi` reports `MISSING: gh-axi (install: npm install -g gh-axi && gh-axi setup hooks)`.
+On a GitHub-using home, an absent or incompatible `gh-axi` reports `MISSING: gh-axi (install: npm install -g gh-axi && gh-axi setup hooks)`; a non-GitHub home does not run that gate.
 An absent or incompatible `lavish-axi` reports `PRESENTATION_UNAVAILABLE` with its required floor, install command, and explicit text fallback; [`bootstrap-diagnostics`](../.agents/skills/bootstrap-diagnostics/SKILL.md) owns the response and compatibility check before visual use.
 An absent or too-old `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; firstmate cannot resolve a profile array without a compatible binary.
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
@@ -1151,6 +1176,7 @@ FM_IMAP_HOST=      # mail-plane IMAP server hostname
 FM_IMAP_PORT=993   # mail-plane IMAP server port
 FM_SMTP_HOST=      # mail-plane SMTP server hostname
 FM_SMTP_PORT=465   # mail-plane SMTP server port
+BITBUCKET_ACCESS_TOKEN= # Bitbucket Cloud bearer token, from environment or .env with Automic Vault fallback (docs/configuration.md "Bitbucket Cloud authentication")
 FMX_PAIRING_TOKEN=      # Relay pairing token; .env opt-in authorizes replies and eligible lifecycle actions
 FMX_RELAY_URL=https://myfirstmate.io   # optional Relay endpoint override, mainly for local relay development
 FMX_ENV_FILE=           # optional alternate .env file for direct Relay client invocations; bootstrap still checks $FM_HOME/.env

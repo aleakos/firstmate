@@ -160,6 +160,50 @@ registered_checks() {
   done
 }
 
+bitbucket_forge_home() {
+  local home=$1
+  mkdir -p "$home/forge" "$home/root/bin" "$home/wt"
+  printf '#!/bin/sh\nexit 0\n' > "$home/root/bin/fm-guard.sh"
+  chmod +x "$home/root/bin/fm-guard.sh"
+  printf -- '- [ ] bitbucket - Bitbucket delivery https://bitbucket.org/workspace/repository/pull-requests/12 (repo: sample) (kind: ship)\n' \
+    >> "$home/data/backlog.md"
+  cat > "$home/fakebin/curl" <<SH
+#!/usr/bin/env bash
+config=\$(cat)
+case "\$config" in
+  *'/pullrequests/12/comments?pagelen=100'*)
+    printf '%s\n' '{"values":[{"id":9,"deleted":false,"user":{"uuid":"{reviewer}","nickname":"maintainer"},"updated_on":"2026-09-16T08:01:00Z","content":{"raw":"Please adjust this"},"links":{"html":{"href":"https://bitbucket.org/workspace/repository/pull-requests/12#comment-9"}}}],"next":null}' ;;
+  *'/pullrequests/12/statuses?pagelen=100'*)
+    printf '%s\n' '{"values":[{"key":"ci","name":"test","state":"SUCCESSFUL","updated_on":"2026-09-16T08:00:00Z"}],"next":null}' ;;
+  *'/pullrequests/12'*)
+    printf '%s\n' '{"id":12,"state":"OPEN","draft":false,"task_count":0,"queued":false,"source":{"commit":{"hash":"$HEAD_A"}},"author":{"uuid":"{author}"},"reviewers":[{"uuid":"{reviewer}"}],"participants":[{"role":"REVIEWER","approved":true,"state":"approved","participated_on":"2026-09-16T07:59:00Z","user":{"uuid":"{reviewer}","nickname":"maintainer"}}],"links":{"html":{"href":"https://bitbucket.org/workspace/repository/pull-requests/12"}}}' ;;
+  *) printf 'unexpected Bitbucket fixture call\n' >&2; exit 1 ;;
+esac
+SH
+  chmod +x "$home/fakebin/curl"
+}
+
+test_bitbucket_pull_request_observation() {
+  local home
+  home=$(new_home bitbucket-observation)
+  bitbucket_forge_home "$home"
+  BITBUCKET_ACCESS_TOKEN=test-token with_home "$home" "$ROOT/bin/fm-contributions.sh" poll >/dev/null \
+    || fail 'could not observe the Bitbucket Cloud pull request'
+  jq -e '
+    .records[0].url == "https://bitbucket.org/workspace/repository/pull-requests/12"
+    and .records[0].observation.head == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    and .records[0].observation.checks[0].conclusion == "success"
+    and .records[0].observation.review_decision == "APPROVED"
+    and .records[0].pending[0].author == "maintainer"' \
+    "$home/data/bitbucket/contributions.json" >/dev/null \
+    || fail 'Bitbucket contribution record did not retain checks, review state, and incoming maintainer feedback'
+  bearings "$home" | jq -e '
+    .contributions.known == 1 and .contributions.checked == 1
+    and .contributions.complete == true and .contributions.counts.fleet == 1' >/dev/null \
+    || fail 'Bitbucket contribution did not remain measured while its conservative mergeability is unresolved'
+  pass 'Bitbucket Cloud pull-request checks, reviews, and maintainer comments are observed durably'
+}
+
 test_incoming_signal() { # comment|review|inline
   local type=$1 home out count fixture wake_count
   case "$type" in comment) fixture=comments ;; review) fixture=reviews ;; *) fixture=inline ;; esac
@@ -502,7 +546,8 @@ test_watcher_surfaces_new_contribution_once() {
   out="$home/watcher.out"
   rc=0
   with_home "$home" env FM_POLL=1 FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 \
-    "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 5 > "$out" 2> "$home/watcher.err" || rc=$?
+    FM_INACTIVE_RECONCILE_BUDGET_SECS=1 \
+    "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 120 > "$out" 2> "$home/watcher.err" || rc=$?
   [ "$rc" -eq 0 ] || fail "watcher did not surface the new contribution signal: $(cat "$home/watcher.err")"
   grep -E '^check: contributions delivery [0-9a-f]{64}$' "$out" >/dev/null \
     || fail "watcher did not surface the durable contribution wake: $(cat "$out")"
@@ -510,7 +555,8 @@ test_watcher_surfaces_new_contribution_once() {
   [ "$rows" = 1 ] || fail "one contribution signal created $rows durable check wakes"
   rc=0
   with_home "$home" env FM_WATCH_HANDLING_SUCCESSOR=1 FM_POLL=1 FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 \
-    "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 2 > "$home/watcher-repeat.out" 2> "$home/watcher-repeat.err" || rc=$?
+    FM_INACTIVE_RECONCILE_BUDGET_SECS=1 \
+    "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 15 > "$home/watcher-repeat.out" 2> "$home/watcher-repeat.err" || rc=$?
   [ "$rc" -eq 124 ] || fail "an already durable contribution signal re-rang the watcher: $(cat "$home/watcher-repeat.out")"
   rows=$(awk -F '\t' 'NF >= 5 && $3 == "check" { count++ } END { print count + 0 }' "$home/state/.wake-queue")
   [ "$rows" = 1 ] || fail "repeat contribution observation created $rows durable check wakes"
@@ -832,7 +878,7 @@ test_late_owner_keeps_failure_episode_suppressed() {
 }
 
 failures=0
-for test_name in test_actor_coverage test_stale_verdict test_unchecked_is_not_silence test_newest_check_has_no_verdict test_comment_wake test_review_wake test_inline_wake test_ready_issue_wake test_fresh_issue_requires_maintainer test_missing_lane_remains_missing test_partial_freshness_keeps_measured_rows test_malformed_record_cannot_prove_silence test_issue_timeline_and_exact_ack test_verdict_retains_judged_head test_observed_replacement_refreshes_verdict test_unobserved_head_leaves_verdict_unknown test_away_yolo_is_fleet_work test_away_yolo_cross_home_is_fleet_work test_retired_and_unsupported_coverage test_unsupported_forge_is_not_fleet_work test_held_unsupported_forge_is_not_captain_work test_shared_contribution_signal_wakes_once test_watcher_keeps_diagnostics_separate_from_contribution_wakes test_expired_child_unsupported_forge_stays_unmeasured test_watcher_surfaces_new_contribution_once test_home_summary_coverage test_unreadable_pending_is_not_empty test_budget_refusal_between_calls test_budget_bounded_call_timeout test_genuine_failure_near_deadline_is_unavailable test_shared_url_observed_once test_terminal_contribution_settles test_late_owner_inherits_terminal_observation test_done_task_open_pr_still_observed test_reservation_defers_later_url_when_fifteen_seconds_do_not_remain test_three_second_pr_reads_complete_fresh_in_one_cycle test_unavailable_forge_records_error_and_wakes_once_per_episode test_late_owner_keeps_failure_episode_suppressed; do
+for test_name in test_actor_coverage test_bitbucket_pull_request_observation test_stale_verdict test_unchecked_is_not_silence test_newest_check_has_no_verdict test_comment_wake test_review_wake test_inline_wake test_ready_issue_wake test_fresh_issue_requires_maintainer test_missing_lane_remains_missing test_partial_freshness_keeps_measured_rows test_malformed_record_cannot_prove_silence test_issue_timeline_and_exact_ack test_verdict_retains_judged_head test_observed_replacement_refreshes_verdict test_unobserved_head_leaves_verdict_unknown test_away_yolo_is_fleet_work test_away_yolo_cross_home_is_fleet_work test_retired_and_unsupported_coverage test_unsupported_forge_is_not_fleet_work test_held_unsupported_forge_is_not_captain_work test_shared_contribution_signal_wakes_once test_watcher_keeps_diagnostics_separate_from_contribution_wakes test_expired_child_unsupported_forge_stays_unmeasured test_watcher_surfaces_new_contribution_once test_home_summary_coverage test_unreadable_pending_is_not_empty test_budget_refusal_between_calls test_budget_bounded_call_timeout test_genuine_failure_near_deadline_is_unavailable test_shared_url_observed_once test_terminal_contribution_settles test_late_owner_inherits_terminal_observation test_done_task_open_pr_still_observed test_reservation_defers_later_url_when_fifteen_seconds_do_not_remain test_three_second_pr_reads_complete_fresh_in_one_cycle test_unavailable_forge_records_error_and_wakes_once_per_episode test_late_owner_keeps_failure_episode_suppressed; do
   ( "$test_name" ) || failures=$((failures + 1))
 done
 [ "$failures" -eq 0 ] || fail "$failures contribution regressions"
