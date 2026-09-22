@@ -265,6 +265,10 @@ case "$config" in
   *'/statuses?pagelen=100'*)
     printf '{"values":[{"key":"ci","name":"ci","state":"%s","updated_on":"2026-01-01T00:00:00Z"}],"next":null}\n' "${FM_TEST_BB_STATUS:-SUCCESSFUL}"
     ;;
+  *'/commit/'*)
+    [ "${FM_TEST_BB_COMMIT_FAIL:-0}" != 1 ] || exit 22
+    printf '{"hash":"%s"}\n' "${FM_TEST_BB_COMMIT_HASH:?}"
+    ;;
   *'/pullrequests/42'*)
     count=$(cat "$FM_TEST_BB_CORE_COUNT" 2>/dev/null || printf 0)
     count=$((count + 1))
@@ -292,11 +296,91 @@ run_merge_case() {
   shift
   FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" \
   FM_TEST_BB_API_LOG="$dir/api.log" FM_TEST_BB_CORE_COUNT="$dir/core.count" \
-  FM_TEST_BB_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  FM_TEST_BB_HEAD="${FM_TEST_BB_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
   FM_TEST_BB_RACE_HEAD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   BITBUCKET_ACCESS_TOKEN="$TOKEN" PATH="$dir/fakebin:$BASE_PATH" \
     "$ROOT/bin/fm-pr-merge.sh" task-x1 \
       https://bitbucket.org/workspace/repository/pull-requests/42 "$@"
+}
+
+# Arms merge monitoring directly, the way firstmate does from a worker's ready
+# line, so the recorded pr_head= is the value under test.
+run_check_case() {
+  local dir=$1
+  shift
+  FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" \
+  FM_TEST_BB_API_LOG="$dir/api.log" FM_TEST_BB_CORE_COUNT="$dir/core.count" \
+  BITBUCKET_ACCESS_TOKEN="$TOKEN" PATH="$dir/fakebin:$BASE_PATH" \
+    "$ROOT/bin/fm-pr-check.sh" task-x1 \
+      https://bitbucket.org/workspace/repository/pull-requests/42 "$@"
+}
+
+test_abbreviated_head_is_resolved_to_full_hash() {
+  local dir
+  dir=$(make_merge_case short-head-resolved)
+  FM_TEST_BB_HEAD=55c4191716de \
+  FM_TEST_BB_COMMIT_HASH=55c4191716de1bb1469c90737388b67f55ea4376 \
+    run_check_case "$dir" > "$dir/stdout" 2> "$dir/stderr" \
+    || fail "abbreviated Bitbucket head was refused: $(cat "$dir/stderr")"
+  assert_grep 'url = "https://api.bitbucket.org/2.0/repositories/workspace/repository/commit/55c4191716de"' \
+    "$dir/api.log" "abbreviated head was not resolved through the documented commit endpoint"
+  assert_grep 'pr_head=55c4191716de1bb1469c90737388b67f55ea4376' "$dir/state/task-x1.meta" \
+    "resolved full head was not recorded"
+  [ "$(grep -c '^pr_head=' "$dir/state/task-x1.meta")" -eq 1 ] \
+    || fail "abbreviated head leaked into the recorded metadata beside the full one"
+  pass "Bitbucket abbreviated source head is resolved and recorded as the full commit hash"
+}
+
+test_abbreviated_head_lookup_failure_refuses() {
+  local dir rc
+  dir=$(make_merge_case short-head-lookup-fails)
+  set +e
+  FM_TEST_BB_HEAD=55c4191716de FM_TEST_BB_COMMIT_FAIL=1 FM_TEST_BB_COMMIT_HASH=unused \
+    run_check_case "$dir" > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "failed commit lookup still armed Bitbucket merge monitoring"
+  assert_grep 'could not be resolved to a full commit hash' "$dir/stderr" \
+    "failed commit lookup was not reported as a head resolution refusal"
+  assert_no_grep 'pr_head=' "$dir/state/task-x1.meta" \
+    "failed commit lookup still recorded a head"
+  pass "Bitbucket abbreviated head refuses when the commit lookup fails"
+}
+
+test_abbreviated_head_mismatch_refuses() {
+  local dir rc
+  dir=$(make_merge_case short-head-mismatch)
+  set +e
+  FM_TEST_BB_HEAD=55c4191716de \
+  FM_TEST_BB_COMMIT_HASH=bc0aadd3a5331bb1469c90737388b67f55ea4376 \
+    run_check_case "$dir" > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "mismatched commit lookup still armed Bitbucket merge monitoring"
+  assert_grep 'could not be resolved to a full commit hash' "$dir/stderr" \
+    "mismatched commit lookup was not reported as a head resolution refusal"
+  assert_no_grep 'pr_head=' "$dir/state/task-x1.meta" \
+    "mismatched commit lookup still recorded a head"
+  pass "Bitbucket abbreviated head refuses when the resolved hash does not extend it"
+}
+
+test_merge_resolves_abbreviated_live_head() {
+  local dir rc
+  dir=$(make_merge_case merge-short-head)
+  set +e
+  FM_TEST_BB_HEAD=55c4191716de \
+  FM_TEST_BB_COMMIT_HASH=55c4191716de1bb1469c90737388b67f55ea4376 \
+    run_merge_case "$dir" > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "Bitbucket merge without an atomic expected-head primitive was accepted"
+  assert_grep 'every reported check green at head 55c4191716de1bb1469c90737388b67f55ea4376' "$dir/stderr" \
+    "merge verification did not canonicalize the abbreviated live head"
+  assert_no_grep 'could not resolve the Bitbucket Cloud pull request head' "$dir/stderr" \
+    "merge verification refused an abbreviated live head it could resolve"
+  assert_no_grep 'request = "POST"' "$dir/api.log" \
+    "Bitbucket exact-head gap still submitted a merge"
+  pass "Bitbucket merge verification resolves an abbreviated live head before comparing it"
 }
 
 test_pr_state_reports_bitbucket_blockers() {
@@ -391,3 +475,7 @@ test_merge_preconditions_refuse_red_builds
 test_merge_preconditions_refuse_change_requests
 test_merge_head_race_refuses_before_submission
 test_stable_green_merge_preserves_exact_head_invariant
+test_abbreviated_head_is_resolved_to_full_hash
+test_abbreviated_head_lookup_failure_refuses
+test_abbreviated_head_mismatch_refuses
+test_merge_resolves_abbreviated_live_head

@@ -41,12 +41,16 @@ Bitbucket Cloud supplies these provider-specific reads:
 
 | Lifecycle operation | Bitbucket API or git evidence |
 | --- | --- |
-| ready registration | pull-request object; refuses drafts and records `source.commit.hash` |
+| ready registration | pull-request object; refuses drafts and records `source.commit.hash` resolved to a full hash |
 | merge monitoring | pull-request `state`, with success only for exact `MERGED` |
 | current task state | pull-request object, open tasks, build statuses, and reviewer `changes_requested` participation |
 | review diff | `refs/pull-requests/<number>/from`, with recorded exact head only as the offline fallback |
 | cleanup | live `MERGED` state plus the live source commit, then the existing ancestry/content proof |
 | contribution observation | pull-request object, reviewers/participants, build statuses, and reviewer comments |
+
+The pull-request object abbreviates `source.commit.hash` to twelve hex characters, so every read of the source head resolves it through `/2.0/repositories/<workspace>/<repository>/commit/<hash>` before recording or comparing it.
+`fm_pr_bitbucket_resolve_head` in [`bin/fm-pr-lib.sh`](../bin/fm-pr-lib.sh) owns that canonicalization and its refusal rules; `fm_pr_head_valid` stays strict so a stored `pr_head=` is never ambiguous.
+The same repository-scoped read token covers the commit endpoint, so the credential contract does not change.
 
 Contribution reads request 100 comments and statuses.
 A response with a `next` page is deliberately rejected as incomplete rather than letting bounded observation look exhaustive.

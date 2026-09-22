@@ -101,8 +101,8 @@ if [ "$PROVIDER" = bitbucket ]; then
     echo "error: Bitbucket Cloud returned an invalid pull request record" >&2
     exit 1
   fi
-  fm_pr_head_valid "$BITBUCKET_HEAD" || {
-    echo "error: Bitbucket Cloud returned an invalid pull request head" >&2
+  BITBUCKET_HEAD=$(fm_pr_bitbucket_resolve_head "$BITBUCKET_WORKSPACE" "$BITBUCKET_REPO" "$BITBUCKET_HEAD") || {
+    echo "error: Bitbucket Cloud returned an invalid pull request head, or its abbreviated head could not be resolved to a full commit hash" >&2
     exit 1
   }
   if [ "${FM_PR_CHECK_MERGE:-}" != 1 ] && [ "$BITBUCKET_DRAFT" = true ]; then

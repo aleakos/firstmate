@@ -1433,7 +1433,8 @@ pr_is_merged() {
       head=$(printf '%s' "$json" | jq -r \
         'if type == "object" and (.source.commit.hash | type) == "string" then .source.commit.hash else "" end' \
         2>/dev/null) || return 1
-      [ "$state" = MERGED ] && fm_pr_head_valid "$head" || return 1
+      [ "$state" = MERGED ] || return 1
+      head=$(fm_pr_bitbucket_resolve_head "$FM_PR_OWNER" "$FM_PR_REPO" "$head") || return 1
       pr_head_contains_local_work "$target" "$head" || return 1
       ;;
     *) return 1 ;;

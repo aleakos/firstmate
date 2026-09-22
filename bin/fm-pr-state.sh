@@ -80,7 +80,8 @@ bitbucket_state() {
   draft=$(printf '%s\n' "$fields" | sed -n 's/^draft=//p')
   head=$(printf '%s\n' "$fields" | sed -n 's/^head=//p')
   tasks=$(printf '%s\n' "$fields" | sed -n 's/^tasks=//p')
-  fm_pr_head_valid "$head" || die "Bitbucket Cloud returned incomplete pull-request state for $URL"
+  head=$(fm_pr_bitbucket_resolve_head "$workspace" "$repo" "$head") \
+    || die "Bitbucket Cloud returned incomplete pull-request state for $URL"
   case "$state" in
     MERGED) printf 'STATE: merged\n'; return 0 ;;
     OPEN) ;;
