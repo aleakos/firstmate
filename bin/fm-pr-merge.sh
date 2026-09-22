@@ -449,10 +449,14 @@ bitbucket_verify_mergeable() {
   done <<FIELDS
 $fields
 FIELDS
-  if [ "$named" -ne 5 ] || [ "$total" -ne 5 ] || ! fm_pr_head_valid "$live_head"; then
+  if [ "$named" -ne 5 ] || [ "$total" -ne 5 ]; then
     echo "error: could not read the Bitbucket Cloud pull request state before merging" >&2
     return 1
   fi
+  live_head=$(fm_pr_bitbucket_resolve_head "$PR_OWNER" "$PR_REPO" "$live_head") || {
+    echo "error: could not resolve the Bitbucket Cloud pull request head to a full commit hash before merging" >&2
+    return 1
+  }
   if ! statuses=$(fm_pr_bitbucket_get_paginated "$api_path/statuses?pagelen=100"); then
     echo "error: could not read the Bitbucket Cloud build status before merging" >&2
     return 1
@@ -504,7 +508,7 @@ bitbucket_recheck_head() {
   live_head=$(printf '%s' "$json" | jq -r \
     'if type == "object" and (.source.commit.hash | type) == "string" then .source.commit.hash else "" end' \
     2>/dev/null) || live_head=
-  fm_pr_head_valid "$live_head" || {
+  live_head=$(fm_pr_bitbucket_resolve_head "$PR_OWNER" "$PR_REPO" "$live_head") || {
     echo "error: could not re-read the Bitbucket Cloud pull request head before the merge boundary" >&2
     return 1
   }

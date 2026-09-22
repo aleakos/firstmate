@@ -271,6 +271,36 @@ fm_pr_bitbucket_api_path() {  # <workspace> <repository> <number> [suffix]
     "$workspace" "$repo" "$number" "$suffix"
 }
 
+# The one canonicalization of a Bitbucket Cloud pull-request source head.
+# Bitbucket's pull-request record abbreviates `source.commit.hash` (twelve hex
+# characters have been observed), while fm_pr_head_valid deliberately accepts
+# only a full 40- or 64-hex value so a stored or compared head is never
+# ambiguous. A full hash is printed unchanged. An abbreviated hash is resolved
+# through the documented commit endpoint and printed only when the response
+# carries a full hash that begins with the abbreviation; a failed lookup, a
+# mismatched hash, or anything that is not a full hash returns non-zero and
+# prints nothing, so every caller refuses instead of recording a short head.
+fm_pr_bitbucket_resolve_head() {  # <workspace> <repository> <hash>
+  local workspace=$1 repo=$2 short=${3-} api_path json full
+  local LC_ALL=C
+  if fm_pr_head_valid "$short"; then
+    printf '%s\n' "$short"
+    return 0
+  fi
+  [[ "$short" =~ ^[0-9a-f]{7,63}$ ]] || return 1
+  fm_pr_bitbucket_path_valid "$workspace/$repo" || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  api_path="/2.0/repositories/$workspace/$repo/commit/$short"
+  json=$("${FM_PR_BITBUCKET_API:-${BASH_SOURCE[0]%/*}/fm-bitbucket-api.sh}" GET "$api_path" 2>/dev/null) \
+    || return 1
+  full=$(printf '%s' "$json" | jq -r '
+    if type == "object" and (.hash | type) == "string" then .hash else "" end' 2>/dev/null) \
+    || return 1
+  fm_pr_head_valid "$full" || return 1
+  [ "${full#"$short"}" != "$full" ] || return 1
+  printf '%s\n' "$full"
+}
+
 fm_pr_file_mode() {
   if [ "$(uname)" = Darwin ]; then
     /usr/bin/stat -f %Lp "$1" 2>/dev/null
