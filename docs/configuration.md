@@ -577,6 +577,7 @@ Failure reports `NEEDS_BITBUCKET_AUTH` with the three supported credential sourc
 A home with no Bitbucket evidence makes no Bitbucket API request.
 
 Firstmate supports canonical `https://bitbucket.org/<workspace>/<repository>/pull-requests/<number>` URLs for readiness registration, exact merged-state monitoring, current-state and blocker reads, review-diff head resolution, cleanup verification, and contribution follow-up.
+Cleanup closes the backlog item with the pull-request URL as a `PR <url>` line in the task body, because `tasks-axi` accepts only `/pull/<number>` URLs as a pr link.
 The contribution observer reads up to 100 comments and build statuses and treats a paginated result beyond that bound as unavailable rather than silently claiming complete coverage.
 Bitbucket Cloud's documented merge endpoint does not expose an atomic expected-source-commit precondition equivalent to GitHub's `--match-head-commit` or GitLab's `--sha`.
 `fm-pr-merge.sh` therefore performs two exact head reads but refuses before submitting a Bitbucket merge, leaving merge monitoring armed; it never weakens the invariant by merging a head that could change between verification and submission.

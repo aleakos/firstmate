@@ -201,12 +201,12 @@ forge() {
   return "$rc"
 }
 
-bitbucket_forge() { # relative API path
+bitbucket_read() { # command... -> one Bitbucket read under the read and poll budgets
   local remaining bounded=0 rc=0 forge_err=${FORGE_ERR:-$TMP/forge.err}
   remaining=$((DEADLINE - $(date +%s)))
   [ "$remaining" -gt 0 ] || { BUDGET_EXHAUSTED=1; : > "$TMP/budget-exhausted"; return 1; }
   if [ "$remaining" -le 5 ]; then bounded=1; else remaining=5; fi
-  fm_run_timed "$remaining" "$SCRIPT_DIR/fm-bitbucket-api.sh" GET "$1" 2> "$forge_err" || rc=$?
+  fm_run_timed "$remaining" "$@" 2> "$forge_err" || rc=$?
   if [ "$rc" -eq 124 ] && [ "$bounded" -eq 1 ]; then
     BUDGET_EXHAUSTED=1
     : > "$TMP/budget-exhausted"
@@ -214,6 +214,18 @@ bitbucket_forge() { # relative API path
     : > "$TMP/forge-unavailable"
   fi
   return "$rc"
+}
+
+bitbucket_forge() { # relative API path
+  bitbucket_read "$SCRIPT_DIR/fm-bitbucket-api.sh" GET "$1"
+}
+
+# Bitbucket abbreviates a pull request's source.commit.hash; the shared
+# fm_pr_bitbucket_resolve_head canonicalizes it, run as one bounded read.
+bitbucket_head() { # workspace repository hash -> full head hash
+  if fm_pr_head_valid "$3"; then printf '%s\n' "$3"; return 0; fi
+  bitbucket_read bash -c '. "$1/fm-pr-lib.sh" && fm_pr_bitbucket_resolve_head "$2" "$3" "$4"' \
+    fm-contributions "$SCRIPT_DIR" "$@"
 }
 
 wait_forges() { # background forge pids from one independent read wave
@@ -228,7 +240,7 @@ wait_forges() { # background forge pids from one independent read wave
 }
 
 observe_bitbucket() { # canonical Bitbucket Cloud PR URL -> normalized JSON
-  local url=$1 workspace repo number api_path head after
+  local url=$1 workspace repo number api_path head_raw head after_raw after
   fm_pr_url_parse "$url" && [ "$FM_PR_PROVIDER" = bitbucket ] || return 1
   workspace=$FM_PR_OWNER
   repo=$FM_PR_REPO
@@ -236,26 +248,36 @@ observe_bitbucket() { # canonical Bitbucket Cloud PR URL -> normalized JSON
   api_path=$(fm_pr_bitbucket_api_path "$workspace" "$repo" "$number") || return 1
   rm -f -- "$TMP/budget-exhausted" "$TMP/forge-unavailable"
   bitbucket_forge "$api_path" > "$TMP/core.json" || return 1
-  head=$(jq -er --argjson number "$number" '
+  head_raw=$(jq -er --argjson number "$number" '
     select(type == "object" and .id == $number and (.state | IN("OPEN","MERGED","DECLINED","SUPERSEDED"))
       and (.draft | type) == "boolean" and (.source.commit.hash | type) == "string")
-    | .source.commit.hash | select(test("^[a-fA-F0-9]{40}$"))' "$TMP/core.json") || return 1
+    | .source.commit.hash' "$TMP/core.json") || return 1
+  # Head resolution depends only on the core read, so it joins the independent wave.
+  FORGE_ERR="$TMP/head.err" bitbucket_head "$workspace" "$repo" "$head_raw" > "$TMP/head" &
+  local head_pid=$!
   FORGE_ERR="$TMP/comments.err" bitbucket_forge "$api_path/comments?pagelen=100" > "$TMP/comments.json" &
   local comments_pid=$!
   FORGE_ERR="$TMP/statuses.err" bitbucket_forge "$api_path/statuses?pagelen=100" > "$TMP/statuses.json" &
   local statuses_pid=$!
-  wait_forges "$comments_pid" "$statuses_pid" || return 1
+  wait_forges "$head_pid" "$comments_pid" "$statuses_pid" || return 1
+  head=$(cat "$TMP/head")
+  fm_pr_head_valid "$head" || return 1
   jq -e 'type == "object" and (.values | type) == "array" and (.next // null) == null' \
     "$TMP/comments.json" "$TMP/statuses.json" >/dev/null || return 1
   bitbucket_forge "$api_path" > "$TMP/after.json" || return 1
-  after=$(jq -er '.source.commit.hash | select(test("^[a-fA-F0-9]{40}$"))' "$TMP/after.json") || return 1
+  after_raw=$(jq -er '.source.commit.hash | strings' "$TMP/after.json") || return 1
+  if [ "$after_raw" = "$head_raw" ]; then
+    after=$head
+  else
+    after=$(bitbucket_head "$workspace" "$repo" "$after_raw") || return 1
+  fi
   [ "$head" = "$after" ] || { printf 'head changed during observation\n' > "$TMP/forge.err"; return 1; }
-  jq -n --slurpfile core "$TMP/core.json" --slurpfile comments "$TMP/comments.json" \
+  jq -n --arg head "$head" --slurpfile core "$TMP/core.json" --slurpfile comments "$TMP/comments.json" \
     --slurpfile statuses "$TMP/statuses.json" '
     $core[0] as $c
     | ([$c.reviewers[]?.uuid] | unique) as $reviewers
     | ([$c.participants[]? | select(.role == "REVIEWER" and .approved == true) | .user.uuid] | unique) as $approved
-    | {head:$c.source.commit.hash,
+    | {head:$head,
        state:(if $c.state == "MERGED" then "merged" elif $c.state == "OPEN" then "open" else "closed" end),
        draft:$c.draft,
        mergeable:"unknown",
