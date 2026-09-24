@@ -128,7 +128,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-check-lib.sh`        | Validate custom-check registrations and prepare private execution snapshots          |
 | `fm-tool-update-check.sh` | Report watched tooling with an update available, and updates installed but left inert by PATH order |
 | `fm-pr-lib.sh`           | Own canonical task and GitHub/GitLab/Bitbucket Cloud PR validation plus private atomic PR-poll publication, merge-notification identity, and retirement |
-| `fm-bitbucket-api.sh`    | Call the fixed Bitbucket Cloud v2 API with a bearer token supplied by environment, local `.env`, or Automic Vault without exposing it in arguments or files |
+| `fm-bitbucket-api.sh`    | Call the fixed Bitbucket Cloud v2 API, reading or creating a pull request, with a bearer token supplied by environment, local `.env`, or Automic Vault without exposing it in arguments or files |
+| `fm-bitbucket-av.sh`     | Self-contained, blessable Automic Vault launcher that validates each Bitbucket Cloud request and performs the one curl call for `fm-bitbucket-api.sh` |
 | `fm-pr-poll.sh`          | Provide the byte-static watcher program for validated PR/MR-poll sidecars           |
 | `fm-contributions.sh`    | Observe owned publications, retain exact-head judgments, measure required actors, and wake on maintainer signals |
 | `fm-pr-check.sh`         | Record validated `pr=` and exact `pr_head=` values, then atomically arm a static merge poll; refuses GitHub and Bitbucket Cloud drafts |

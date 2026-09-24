@@ -551,14 +551,27 @@ The live rule-match evidence is recorded in [`verification/dispatch-resolve.md`]
 
 Bitbucket Cloud pull requests use the documented `https://api.bitbucket.org/2.0` API through [`bin/fm-bitbucket-api.sh`](../bin/fm-bitbucket-api.sh).
 Set `BITBUCKET_ACCESS_TOKEN` in the process environment or this firstmate home's gitignored `.env`.
-The environment wins.
-If neither source contains the token and `av` is available, the helper runs itself through `av inject +BITBUCKET_ACCESS_TOKEN -- ...`, allowing Automic Vault to provide the value without copying it into firstmate state.
-Grant the token read access to the repositories, pull requests, comments, tasks, and commit/build statuses this home will supervise.
-Use the narrowest repository or workspace scope that covers those reads.
-This token authenticates Firstmate's Bitbucket API reads; configure SSH or HTTPS Git credentials separately for clone, fetch, push, and pull-request branch refs.
+The environment wins, then `.env`.
+If neither source contains the token and `av` is available, the helper runs the launcher [`bin/fm-bitbucket-av.sh`](../bin/fm-bitbucket-av.sh) under Automic Vault exactly as its `#!/usr/local/bin/av inject +BITBUCKET_ACCESS_TOKEN /bin/sh` shebang declares, allowing Automic Vault to provide the value without copying it into firstmate state.
+Grant the token read access to the repositories, pull requests, comments, tasks, and commit/build statuses this home will supervise, plus pull-request write access if workers create pull requests through the helper.
+Use the narrowest repository or workspace scope that covers those operations.
+This token authenticates Firstmate's Bitbucket API calls; configure SSH or HTTPS Git credentials separately for clone, fetch, push, and pull-request branch refs.
 
 The helper never puts the token in command arguments, repository files, state, or output.
 It supplies the `Authorization: Bearer` header to `curl` through standard-input configuration and fixes requests to Bitbucket Cloud's HTTPS API host.
+`GET` accepts any `/2.0/` path; the only write is `POST /2.0/repositories/<workspace>/<repository>/pullrequests` with a regular JSON body file of at most 1 MiB, which creates a pull request.
+Workers create and read back a Bitbucket pull request through the home's copy of the helper, where `<home>` is this firstmate home's code root, instead of calling `av inject ... curl` themselves:
+
+```sh
+jq -n --arg title "$TITLE" --arg description "$BODY" --arg source "$BRANCH" --arg destination main \
+  '{title: $title, description: $description, source: {branch: {name: $source}}, destination: {branch: {name: $destination}}}' \
+  > "$TMPDIR/pr.json"
+<home>/bin/fm-bitbucket-api.sh POST /2.0/repositories/<workspace>/<repository>/pullrequests "$TMPDIR/pr.json" \
+  | jq -r '.links.html.href'
+<home>/bin/fm-bitbucket-api.sh GET /2.0/repositories/<workspace>/<repository>/pullrequests/<number> \
+  | jq '{state, draft}'
+```
+
 A home with a Bitbucket origin or durable Bitbucket pull-request URL checks this credential during the deferred startup network stage.
 Failure reports `NEEDS_BITBUCKET_AUTH` with the three supported credential sources.
 A home with no Bitbucket evidence makes no Bitbucket API request.
@@ -569,6 +582,42 @@ Bitbucket Cloud's documented merge endpoint does not expose an atomic expected-s
 `fm-pr-merge.sh` therefore performs two exact head reads but refuses before submitting a Bitbucket merge, leaving merge monitoring armed; it never weakens the invariant by merging a head that could change between verification and submission.
 Merge the pull request in Bitbucket, then the existing monitor verifies the exact `MERGED` state and normal cleanup continues.
 See [`docs/bitbucket-cloud.md`](bitbucket-cloud.md) for the maintainer-facing parity and verification record.
+
+### Blessing the Automic Vault launcher
+
+Without a Blessing, every Vault-backed call asks for a fresh Automic Vault approval, so background merge monitoring, contribution observation, and worker pull-request creation stop whenever no one approves.
+Blessing binds one reviewed launcher, so bless the home's own copy, not a task worktree's copy.
+As a one-time step after this launcher lands and the home has updated, review [`bin/fm-bitbucket-av.sh`](../bin/fm-bitbucket-av.sh) and run:
+
+```sh
+av bless --endorse-launcher <home>/bin/fm-bitbucket-av.sh
+```
+
+Automic Vault's review shows the script digest, interpreter, and the single Secret Name `BITBUCKET_ACCESS_TOKEN`.
+Without `--endorse-launcher` the Blessing still requires approval on every run; the endorsement lets one exact Verified Launcher use automatic authorization for this script.
+It covers every operation the launcher permits: any Bitbucket Cloud API read and pull-request creation, never a merge.
+Confirm in the Automic Vault app's Blessed Scripts view that it is the app that runs this home's firstmate session and its background monitoring; that view can also narrow, replace, or revoke the Blessing.
+If background calls still prompt, compare the launcher `av history` records for the prompting request with the endorsed one.
+
+The Blessing binds the launcher's path, file type, size, interpreter, declaration, and content.
+Editing, replacing, or moving `bin/fm-bitbucket-av.sh` invalidates it, and calls fall back to per-run approval until you review the diff and bless again.
+Every other Firstmate script, including `bin/fm-bitbucket-api.sh`, can change without re-blessing, so after an update re-bless only when `git diff <previous-head> HEAD -- bin/fm-bitbucket-av.sh` is not empty.
+An unexplained change is evidence to investigate, not a reason to re-bless.
+
+A locked Mac is separate from authorization.
+A Secret whose availability is When Unlocked cannot be read while the Mac is locked, so a request fails before any approval, for example with Keychain error `-25308`, even when the launcher is blessed.
+For unattended work, unlock the Mac, run `av open`, open Secrets, select `BITBUCKET_ACCESS_TOKEN`, and enable Available While Locked.
+That setting still needs the first unlock after a restart and does not wake a sleeping or shut-down Mac.
+
+Verify the Blessing from the app that runs firstmate, with no token in this home's `.env`:
+
+```sh
+env -u BITBUCKET_ACCESS_TOKEN <home>/bin/fm-bitbucket-api.sh GET /2.0/repositories/<workspace>/<repository>/pullrequests/<number> | jq -r .state
+av history --since 10m
+```
+
+The read must print the pull request's state without an approval prompt, and `av history` should show the request authorized by policy rather than by a human.
+Repeat the read with the Mac locked to confirm the Available While Locked setting.
 
 ## Toolchain
 

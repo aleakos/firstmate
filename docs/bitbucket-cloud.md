@@ -17,16 +17,18 @@ The corresponding API identity is fixed beneath `https://api.bitbucket.org/2.0/r
 
 ## Credential boundary
 
-`bin/fm-bitbucket-api.sh` is the only bearer-authenticated Bitbucket client.
-Credential precedence is the ambient `BITBUCKET_ACCESS_TOKEN`, then the home's gitignored `.env`, then an Automic Vault reinvocation:
+`bin/fm-bitbucket-api.sh` is the only bearer-authenticated Bitbucket client entry point, and every request it makes runs through the self-contained launcher `bin/fm-bitbucket-av.sh`, which owns request validation and the curl call.
+Credential precedence is the ambient `BITBUCKET_ACCESS_TOKEN`, then the home's gitignored `.env`, both handed to the launcher on standard input, then an Automic Vault run of the launcher exactly as its shebang declares:
 
 ```sh
-av inject +BITBUCKET_ACCESS_TOKEN -- bin/fm-bitbucket-api.sh ...
+av inject +BITBUCKET_ACCESS_TOKEN /bin/sh bin/fm-bitbucket-av.sh ...
 ```
 
-The helper never places the token in argv or a temporary file.
-It sends a curl configuration on standard input containing the fixed HTTPS URL, bearer header, GET method, and timeouts.
-The transport is read-only; merge code has no POST primitive to invoke after the atomic-head check refuses submission.
+Keeping every Vault-backed request in that one rarely-changing file is what lets an operator bless it once; the operator procedure is in [configuration.md](configuration.md#blessing-the-automic-vault-launcher).
+The helper validates a request with the launcher's `--check` mode before choosing a credential source, so a refused request never prompts for Vault approval.
+Neither script places the token in argv, a child environment, or a temporary file.
+The launcher sends a curl configuration on standard input containing the fixed HTTPS URL, bearer header, method, and timeouts.
+Its only write is `POST /2.0/repositories/<workspace>/<repository>/pullrequests` with a JSON body file, which creates a pull request; merge code has no merge POST primitive to invoke after the atomic-head check refuses submission.
 API failures remain failures and response bodies are not converted into successful observations.
 
 `fm_detect_forge_usage` derives applicable providers from project origins and durable delivery records.
@@ -86,5 +88,5 @@ bin/fm-test-run.sh \
   tests/fm-bootstrap.test.sh
 ```
 
-The fixtures prove ambient-token and Automic Vault transport without argv leakage, strict URL rejection, exact merged polling, head capture, state/blocker rendering, provider git-ref selection, contribution checks/reviews/comments, cleanup of a confirmed landed head, conditional GitHub tooling, conditional Bitbucket authentication diagnostics, refusal on red builds and head movement, and the no-atomic-head merge refusal.
+The fixtures prove ambient-token, `.env`, and Automic Vault transport through the launcher without argv or environment leakage, source precedence, pull-request creation, refusal of invalid requests before any Vault approval or curl call, strict URL rejection, exact merged polling, head capture, state/blocker rendering, provider git-ref selection, contribution checks/reviews/comments, cleanup of a confirmed landed head, conditional GitHub tooling, conditional Bitbucket authentication diagnostics, refusal on red builds and head movement, and the no-atomic-head merge refusal.
 The tests use byte-controlled fake API responses and do not claim live Bitbucket credentials or a live destructive merge.
