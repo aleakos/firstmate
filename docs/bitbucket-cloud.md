@@ -33,7 +33,9 @@ Keeping every Vault-backed request in that one rarely-changing file is what lets
 The helper validates a request with the launcher's `--check` mode before choosing a credential source, so a refused request never prompts for Vault approval.
 Neither script places the token in argv, a child environment, or a temporary file.
 The launcher sends a curl configuration on standard input containing the fixed HTTPS URL, bearer header, method, and timeouts.
-Its only write is `POST /2.0/repositories/<workspace>/<repository>/pullrequests` with a JSON body file, which creates a pull request; merge code has no merge POST primitive to invoke after the atomic-head check refuses submission.
+It has exactly two writes, each from a JSON body file: `POST /2.0/repositories/<workspace>/<repository>/pullrequests` creates a pull request, and `POST /2.0/repositories/<workspace>/<repository>/pullrequests/<number>/comments` posts a reply under an existing comment of that pull request.
+A reply body must be exactly the `jq -cS` serialization of `content.raw` (1 to 4000 characters) and a positive integer `parent.id`, so it cannot open an inline or top-level thread, and the launcher first reads `.../comments/<parent>` on the same pull request and refuses a missing or deleted parent; the helper's `reply` operation builds that body from a canonical pull-request URL.
+No edit, delete, approval, task, thread-resolution, or merge endpoint is reachable, so merge code has no merge POST primitive to invoke after the atomic-head check refuses submission.
 API failures remain failures and response bodies are not converted into successful observations.
 
 `fm_detect_forge_usage` derives applicable providers from project origins and durable delivery records.
@@ -54,6 +56,7 @@ Bitbucket Cloud supplies these provider-specific reads:
 | review diff | `refs/pull-requests/<number>/from`, with recorded exact head only as the offline fallback |
 | cleanup | live `MERGED` state plus the live source commit, then the existing ancestry/content proof; the backlog close records the URL as a `PR <url>` task-body line |
 | contribution observation | pull-request object, reviewers/participants, build statuses, and reviewer comments |
+| review-comment reply | parent comment read, then one reply POST under it; the author is the pull request's own token user, whose comments contribution observation ignores |
 
 The pull-request object abbreviates `source.commit.hash` to twelve hex characters, so every read of the source head, including both contribution-observation reads, resolves it through `/2.0/repositories/<workspace>/<repository>/commit/<hash>` before recording or comparing it.
 `fm_pr_bitbucket_resolve_head` in [`bin/fm-pr-lib.sh`](../bin/fm-pr-lib.sh) owns that canonicalization and its refusal rules; `fm_pr_head_valid` stays strict so a stored `pr_head=` is never ambiguous.
@@ -95,5 +98,5 @@ bin/fm-test-run.sh \
   tests/fm-bootstrap.test.sh
 ```
 
-The fixtures prove ambient-token, `.env`, and Automic Vault transport through the launcher without argv or environment leakage, source precedence, per-repository Secret selection through the rendered launcher with no fallback to the default token, refusal of malformed mappings and undeclared Secret Names, pull-request creation, refusal of invalid requests before any Vault approval or curl call, strict URL rejection, exact merged polling, head capture, state/blocker rendering, provider git-ref selection, contribution checks/reviews/comments, cleanup of a confirmed landed head, conditional GitHub tooling, conditional Bitbucket authentication diagnostics, refusal on red builds and head movement, and the no-atomic-head merge refusal.
+The fixtures prove ambient-token, `.env`, and Automic Vault transport through the launcher without argv or environment leakage, source precedence, per-repository Secret selection through the rendered launcher with no fallback to the default token, refusal of malformed mappings and undeclared Secret Names, pull-request creation, review-comment replies only under an existing undeleted parent, refusal of every other comment path and body shape, refusal of invalid requests before any Vault approval or curl call, strict URL rejection, exact merged polling, head capture, state/blocker rendering, provider git-ref selection, contribution checks/reviews/comments, cleanup of a confirmed landed head, conditional GitHub tooling, conditional Bitbucket authentication diagnostics, refusal on red builds and head movement, and the no-atomic-head merge refusal.
 The tests use byte-controlled fake API responses and do not claim live Bitbucket credentials or a live destructive merge.

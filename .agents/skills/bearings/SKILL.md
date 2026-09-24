@@ -196,6 +196,7 @@ When a maintainer verdict has an identifiable judged commit, record it through t
 Never bind old prose to the head current at capture time merely because no judged head was supplied.
 A STALE verdict describes an earlier version; keep its provenance and reassess the current version before treating its blocker as current.
 Route repairs already within accepted intent to the fleet.
+When the repair answers a Bitbucket pull-request comment, the steer tells the worker to reply under that comment once the change is pushed, stating what changed and the commit id through the helper's `reply` operation ([`docs/configuration.md`](../../../docs/configuration.md#bitbucket-cloud-authentication)), and never to resolve the thread, which the reviewer closes.
 Carry any unresolved scope or authority choice through `captain-hold-lifecycle` in the owning task, then surface it through the existing Captain's Call.
 The classifier does not infer a captain decision from comment prose, and a recorded captain-actor verdict without a live hold asks the fleet to reconcile that missing arbitration.
 A merge-ready classification grants no merge authority and the ordinary exact-PR checks still govern any later approval.

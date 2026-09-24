@@ -29,9 +29,19 @@ for name in ${FM_TEST_SECRET_NAMES:-}; do
 done
 printf '%s\n' "$*" > "$FM_TEST_CURL_ARGS"
 printf '%s\n' "$config" > "$FM_TEST_CURL_CONFIG"
+[ -z "${FM_TEST_CURL_CONFIG_LOG:-}" ] || printf '%s\n' "$config" >> "$FM_TEST_CURL_CONFIG_LOG"
 case "$config" in
   *"Authorization: Bearer $FM_TEST_EXPECT_TOKEN"*) ;;
   *) printf 'missing bearer credential\n' >&2; exit 91 ;;
+esac
+body=$(printf '%s\n' "$config" | sed -n 's/^data-binary = "@\(.*\)"$/\1/p')
+if [ -n "$body" ] && [ -n "${FM_TEST_CURL_BODY_COPY:-}" ]; then
+  printf '%s\n' "$body" > "$FM_TEST_CURL_BODY_COPY.path"
+  cp "$body" "$FM_TEST_CURL_BODY_COPY"
+fi
+case "$config" in
+  *'/comments/'[0-9]*'"'*)
+    [ -z "${FM_TEST_CURL_PARENT_RESPONSE:-}" ] || { cat "$FM_TEST_CURL_PARENT_RESPONSE"; exit 0; } ;;
 esac
 cat "$FM_TEST_CURL_RESPONSE"
 SH
@@ -186,6 +196,118 @@ test_pull_request_creation_posts_only_the_body_file() {
   assert_not_contains "$(cat "$dir/curl.args")" "$TOKEN" \
     "pull-request creation: credential leaked into curl process arguments"
   pass "Bitbucket pull-request creation posts only the validated body file through the launcher"
+}
+
+test_comment_reply_posts_only_under_an_existing_comment() {
+  local dir out log message
+  dir="$TMP_ROOT/comment-reply"
+  mkdir -p "$dir/home"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  printf '%s\n' '{"id":42,"deleted":false,"content":{"raw":"please reword"}}' > "$dir/parent.json"
+  printf '%s\n' '{"id":43,"parent":{"id":42}}' > "$dir/response.json"
+  message="Reworded to: 'The ticket closes only on merge; declining the PR leaves it open.' (commit 33496bd)"
+
+  out=$(FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+    FM_TEST_CURL_CONFIG_LOG="$dir/config.log" FM_TEST_CURL_BODY_COPY="$dir/sent.json" \
+    FM_TEST_CURL_PARENT_RESPONSE="$dir/parent.json" \
+    run_api "$dir" reply https://bitbucket.org/workspace/repository/pull-requests/7 42 "$message")
+
+  assert_contains "$out" '"id":43' "comment reply: API response was not relayed"
+  assert_equals "$(cat "$dir/av.log")" \
+    "inject +BITBUCKET_ACCESS_TOKEN /bin/sh $LAUNCHER --secret BITBUCKET_ACCESS_TOKEN POST /2.0/repositories/workspace/repository/pullrequests/7/comments $(cat "$dir/sent.json.path")" \
+    "comment reply: the reply did not run as one launcher POST"
+  log=$(cat "$dir/config.log")
+  assert_contains "$log" 'url = "https://api.bitbucket.org/2.0/repositories/workspace/repository/pullrequests/7/comments/42"' \
+    "comment reply: the parent comment was not read on the same pull request first"
+  assert_equals "$(grep -c '^request = "POST"' "$dir/config.log")" 1 "comment reply: expected exactly one POST"
+  assert_contains "$(cat "$dir/curl.config")" 'url = "https://api.bitbucket.org/2.0/repositories/workspace/repository/pullrequests/7/comments"' \
+    "comment reply: the POST left the pull request's comment collection"
+  assert_equals "$(jq -c . "$dir/sent.json")" \
+    "$(jq -cn --arg raw "$message" '{content:{raw:$raw},parent:{id:42}}')" \
+    "comment reply: the posted body was not exactly the message under the parent comment"
+  assert_absent "$(cat "$dir/sent.json.path")" "comment reply: the body file was left behind"
+  assert_not_contains "$(cat "$dir/curl.args")" "$TOKEN" "comment reply: credential leaked into curl arguments"
+  pass "Bitbucket comment reply posts only the message under an existing comment of the same pull request"
+}
+
+test_comment_reply_refuses_a_missing_or_deleted_parent() {
+  local dir rc parent
+  dir="$TMP_ROOT/comment-reply-parent"
+  mkdir -p "$dir/home"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  printf '%s\n' '{"id":44}' > "$dir/response.json"
+  for parent in '{"id":42,"deleted":true}' '{"id":41}' '{"type":"error"}'; do
+    printf '%s\n' "$parent" > "$dir/parent.json"
+    : > "$dir/config.log"
+    set +e
+    FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+      FM_TEST_CURL_CONFIG_LOG="$dir/config.log" FM_TEST_CURL_PARENT_RESPONSE="$dir/parent.json" \
+      run_api "$dir" reply https://bitbucket.org/workspace/repository/pull-requests/7 42 'Done.' \
+      > "$dir/stdout" 2> "$dir/stderr"
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] || fail "comment reply under $parent exited $rc instead of 1"
+    assert_no_grep 'request = "POST"' "$dir/config.log" "comment reply under $parent still posted"
+  done
+  pass "Bitbucket comment reply refuses a parent that is deleted or not on this pull request"
+}
+
+test_comment_reply_refuses_other_shapes_before_vault_or_curl() {
+  local dir rc case_name body path comments long
+  dir="$TMP_ROOT/comment-reply-invalid"
+  mkdir -p "$dir/home"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  printf '%s\n' '{}' > "$dir/response.json"
+  comments=/2.0/repositories/workspace/repository/pullrequests/7/comments
+  long=$(head -c 4001 /dev/zero | tr '\0' a)
+  while IFS='|' read -r case_name path body; do
+    printf '%s\n' "$body" > "$dir/body.json"
+    set +e
+    FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+      run_api "$dir" POST "$path" "$dir/body.json" > "$dir/stdout" 2> "$dir/stderr"
+    rc=$?
+    set -e
+    [ "$rc" -eq 2 ] || fail "invalid comment request ($case_name) exited $rc instead of 2"
+    assert_absent "$dir/av.log" "invalid comment request ($case_name) still asked Automic Vault"
+    assert_absent "$dir/curl.args" "invalid comment request ($case_name) still invoked curl"
+  done <<CASES
+top-level comment|$comments|{"content":{"raw":"x"}}
+extra top-level field|$comments|{"content":{"raw":"x"},"inline":{"path":"a"},"parent":{"id":1}}
+extra content field|$comments|{"content":{"html":"x","raw":"x"},"parent":{"id":1}}
+extra parent field|$comments|{"content":{"raw":"x"},"parent":{"id":1,"x":2}}
+pending flag|$comments|{"content":{"raw":"x"},"parent":{"id":1},"pending":true}
+string id|$comments|{"content":{"raw":"x"},"parent":{"id":"1"}}
+zero id|$comments|{"content":{"raw":"x"},"parent":{"id":0}}
+fractional id|$comments|{"content":{"raw":"x"},"parent":{"id":1.5}}
+decimal id|$comments|{"content":{"raw":"x"},"parent":{"id":1.0}}
+empty message|$comments|{"content":{"raw":""},"parent":{"id":1}}
+oversize message|$comments|{"content":{"raw":"$long"},"parent":{"id":1}}
+duplicate key|$comments|{"content":{"raw":"x"},"parent":{"id":1},"parent":{"id":2}}
+second value|$comments|{"content":{"raw":"x"},"parent":{"id":1}} {"content":{"raw":"y"},"parent":{"id":2}}
+not canonical|$comments|{ "content": {"raw": "x"}, "parent": {"id": 1} }
+comment edit|$comments/5|{"content":{"raw":"x"},"parent":{"id":1}}
+thread resolution|$comments/5/resolve|{"content":{"raw":"x"},"parent":{"id":1}}
+task creation|/2.0/repositories/workspace/repository/pullrequests/7/tasks|{"content":{"raw":"x"},"parent":{"id":1}}
+approval|/2.0/repositories/workspace/repository/pullrequests/7/approve|{"content":{"raw":"x"},"parent":{"id":1}}
+padded number|/2.0/repositories/workspace/repository/pullrequests/07/comments|{"content":{"raw":"x"},"parent":{"id":1}}
+missing number|/2.0/repositories/workspace/repository/pullrequests//comments|{"content":{"raw":"x"},"parent":{"id":1}}
+nested number|/2.0/repositories/workspace/repository/pullrequests/7/8/comments|{"content":{"raw":"x"},"parent":{"id":1}}
+CASES
+  for case_name in 'https://github.com/owner/repo/pull/7|42' \
+    'https://bitbucket.org/workspace/repository/pull-requests/7|abc' \
+    'https://bitbucket.org/workspace/repository/pull-requests/7|0'; do
+    set +e
+    FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+      run_api "$dir" reply "${case_name%|*}" "${case_name#*|}" 'Done.' > "$dir/stdout" 2> "$dir/stderr"
+    rc=$?
+    set -e
+    [ "$rc" -eq 2 ] || fail "invalid reply ($case_name) exited $rc instead of 2"
+    assert_absent "$dir/av.log" "invalid reply ($case_name) still asked Automic Vault"
+  done
+  pass "Bitbucket comment POST refuses every other path and body shape before any Automic Vault approval or network call"
 }
 
 test_invalid_requests_refuse_before_vault_or_curl() {
@@ -797,6 +919,9 @@ test_home_env_token_never_enters_arguments
 test_vault_injection_names_only_the_secret
 test_environment_and_home_env_win_over_vault
 test_pull_request_creation_posts_only_the_body_file
+test_comment_reply_posts_only_under_an_existing_comment
+test_comment_reply_refuses_a_missing_or_deleted_parent
+test_comment_reply_refuses_other_shapes_before_vault_or_curl
 test_invalid_requests_refuse_before_vault_or_curl
 test_launcher_check_and_stdin_modes_keep_the_token_private
 test_render_launcher_declares_every_mapped_secret

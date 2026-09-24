@@ -277,6 +277,16 @@
 #   This is an exec environment boundary, not a sandbox for the pane's startup
 #   shell, credential files, same-user processes, or later shell initialization.
 #   See docs/configuration.md for provider/Git setup and supported limits.
+# Worker commit identity (config/commit-identity):
+#   A ship or scout whose project resolves an identity through
+#   bin/fm-commit-identity-lib.sh, which owns the file format and defaults,
+#   receives it as GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME, and
+#   GIT_COMMITTER_EMAIL on a fresh spawn and on a relaunch, through the same
+#   pane-export and launch-export channels as the Lavish address; the launch
+#   export sits inside any env -i boundary, so no floor entry is needed. Nothing is
+#   written to any git config, so the operator's global identity and every
+#   checkout's own configuration stay unchanged. A project without a matching
+#   line gets no assignment; a malformed file refuses before any endpoint.
 # Claude permission mode (config/claude-permission-mode):
 #   One token selecting the permission flag every claude launch (ship, scout,
 #   secondmate, and relaunch) carries. Absent or `bypass` keeps today's
@@ -552,6 +562,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-dod-lib.sh"
 # shellcheck source=bin/fm-trace-context-lib.sh
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
+# shellcheck source=bin/fm-commit-identity-lib.sh
+. "$SCRIPT_DIR/fm-commit-identity-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
 # shellcheck source=bin/fm-timeout-lib.sh
@@ -2704,6 +2716,7 @@ else
   PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
   WT=""
   BRIEF="$DATA/$ID/brief.md"
+  fm_commit_identity_resolve "$CONFIG/commit-identity" "$(basename "$PROJ_ABS")" || exit 1
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   SPAWN_TREEHOUSE_PROJECT_LOCK=$(fm_treehouse_project_lock_path "$PROJ_ABS") || {
@@ -4686,6 +4699,16 @@ fi
 if [ "$LAVISH_AXI_HOST_CONFIG_PRESENT" = 1 ]; then
   LAUNCH="export LAVISH_AXI_HOST=$(shell_quote "$LAVISH_AXI_HOST"); $LAUNCH"
 fi
+# The worker commit identity (header "Worker commit identity") rides both
+# channels for the same reason: the launch export reaches the agent even when
+# the pane export did not land, and the pane export covers later pane commands.
+COMMIT_IDENTITY_EXPORT=
+if [ -n "$FM_COMMIT_IDENTITY_EMAIL" ]; then
+  sq_ident_name=$(shell_quote "$FM_COMMIT_IDENTITY_NAME")
+  sq_ident_email=$(shell_quote "$FM_COMMIT_IDENTITY_EMAIL")
+  COMMIT_IDENTITY_EXPORT="export GIT_AUTHOR_NAME=$sq_ident_name GIT_AUTHOR_EMAIL=$sq_ident_email GIT_COMMITTER_NAME=$sq_ident_name GIT_COMMITTER_EMAIL=$sq_ident_email"
+  LAUNCH="$COMMIT_IDENTITY_EXPORT; $LAUNCH"
+fi
 LAUNCH="export COMPACT_ADVISER_DISABLE=1; $LAUNCH"
 if [ -z "$SPAWN_TRACEPARENT" ] && [ "$RELAUNCH" -eq 1 ]; then
   LAUNCH="unset TRACEPARENT; $LAUNCH"
@@ -4735,6 +4758,9 @@ fi
 # syntax of its own.
 if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
   spawn_send_text_line "$T" "export FM_TASK_ID=$ID"
+fi
+if [ -n "$COMMIT_IDENTITY_EXPORT" ]; then
+  spawn_send_text_line "$T" "$COMMIT_IDENTITY_EXPORT"
 fi
 # Send through the exact channel that already ships GOTMPDIR, so every backend
 # and harness - ship, scout, and secondmate - gets it before launch. Skipped
