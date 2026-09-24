@@ -386,6 +386,25 @@ When the file is absent, worker launches do not add a board address and retain t
 Malformed or unreadable values refuse the launch before the worker starts, while the adapter refuses the same malformed value before polling.
 The address selects the existing shared server; it does not authorize starting or stopping the server, and the Lavish startup crash remains a vendor-tool concern.
 
+## Worker commit identity (config/commit-identity)
+
+The optional local, gitignored `config/commit-identity` gives ship and scout workers a bot author and committer, so a project's history shows which commits an agent wrote.
+Each non-blank line is `<project|*> [<email> [<name>]]`, with `#` starting a comment:
+
+```text
+agent-factory amr-agent@firstmate.invalid amr-agent (firstmate)
+amr-engine
+```
+
+`<project>` is the project's directory name under `projects/`, and a `*` line covers every project without its own line.
+An omitted email defaults to `<project>-agent@firstmate.invalid`, whose reserved `.invalid` domain never routes mail, and an omitted name defaults to `<project> agent (firstmate)`.
+`fm-spawn.sh` sets `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL` in the worker's environment on every new launch and relaunch, and writes nothing to any git config, so the operator's global identity and every checkout's own configuration stay unchanged.
+Only the worker's own environment carries the identity, so a commit made by a separate long-lived process, such as a shared validation daemon, keeps git's configured identity.
+Pushes still use the operator's own SSH or HTTPS credentials, merge authority is unchanged, and the identity never adds a co-author trailer.
+A project with no matching line, and every project when the file is absent, keeps git's own identity, because a forge or hook that requires commits from a verified address would otherwise start rejecting that repository's pushes.
+A malformed or duplicate line refuses every ship and scout spawn from the home before any worker exists.
+The file is home-local and not inherited by secondmate homes; [`bin/fm-commit-identity-lib.sh`](../bin/fm-commit-identity-lib.sh) owns the format and defaults.
+
 ## Home brief include (config/brief-include.md)
 
 The optional local, gitignored `config/brief-include.md` carries standing worker instructions that one captain wants on every ship and scout brief, so private brief content needs no edit to a tracked file.
@@ -553,7 +572,7 @@ Bitbucket Cloud pull requests use the documented `https://api.bitbucket.org/2.0`
 Set `BITBUCKET_ACCESS_TOKEN` in the process environment or this firstmate home's gitignored `.env`.
 The environment wins, then `.env`.
 If neither source contains the token and `av` is available, the helper runs the launcher [`bin/fm-bitbucket-av.sh`](../bin/fm-bitbucket-av.sh) under Automic Vault exactly as its `#!/usr/local/bin/av inject +BITBUCKET_ACCESS_TOKEN /bin/sh` shebang declares, allowing Automic Vault to provide the value without copying it into firstmate state.
-Grant the token read access to the repositories, pull requests, comments, tasks, and commit/build statuses this home will supervise, plus pull-request write access if workers create pull requests through the helper.
+Grant the token read access to the repositories, pull requests, comments, tasks, and commit/build statuses this home will supervise, plus pull-request write access if workers create pull requests or reply to review comments through the helper.
 Use the narrowest repository or workspace scope that covers those operations.
 This token authenticates Firstmate's Bitbucket API calls; configure SSH or HTTPS Git credentials separately for clone, fetch, push, and pull-request branch refs.
 
@@ -587,7 +606,10 @@ Adding, renaming, or removing a mapping therefore needs one `render-launcher` ru
 
 The helper never puts the token in command arguments, repository files, state, or output.
 It supplies the `Authorization: Bearer` header to `curl` through standard-input configuration and fixes requests to Bitbucket Cloud's HTTPS API host.
-`GET` accepts any `/2.0/` path; the only write is `POST /2.0/repositories/<workspace>/<repository>/pullrequests` with a regular JSON body file of at most 1 MiB, which creates a pull request.
+`GET` accepts any `/2.0/` path, and there are exactly two writes, each from a regular JSON body file of at most 1 MiB.
+`POST /2.0/repositories/<workspace>/<repository>/pullrequests` creates a pull request.
+`POST /2.0/repositories/<workspace>/<repository>/pullrequests/<number>/comments` posts a reply under an existing comment of that pull request; its body may carry only the reply text of 1 to 4000 characters and the parent comment's numeric id, and the launcher reads that comment on the same pull request before posting, so it can neither start a new or inline thread nor edit, delete, approve, create a task, or resolve anything.
+The launcher header owns the exact accepted shapes.
 Workers create and read back a Bitbucket pull request through the home's copy of the helper, where `<home>` is this firstmate home's code root, instead of calling `av inject ... curl` themselves:
 
 ```sh
@@ -599,6 +621,16 @@ jq -n --arg title "$TITLE" --arg description "$BODY" --arg source "$BRANCH" --ar
 <home>/bin/fm-bitbucket-api.sh GET /2.0/repositories/<workspace>/<repository>/pullrequests/<number> \
   | jq '{state, draft}'
 ```
+
+After pushing a change a reviewer asked for in a pull-request comment, the worker replies under that comment with what changed and the commit id; the comment id is the number in the comment's `#comment-<id>` link:
+
+```sh
+<home>/bin/fm-bitbucket-api.sh reply https://bitbucket.org/<workspace>/<repository>/pull-requests/<number> <comment-id> \
+  "Reworded to: 'The ticket closes only on merge; declining the PR leaves it open.' (commit 33496bd)"
+```
+
+The reply is authored by the token's user, so on a mapped repository it comes from the same bot that opened the pull request, and the contribution follow-up does not wake on it because it ignores the pull-request author's own comments.
+Nothing resolves the thread; the reviewer closes it.
 
 A home with a Bitbucket origin or durable Bitbucket pull-request URL checks this credential during the deferred startup network stage.
 Failure reports `NEEDS_BITBUCKET_AUTH` with the three supported credential sources.
@@ -632,7 +664,7 @@ av bless --endorse-launcher <home>/config/bitbucket-av.sh
 
 Automic Vault's review shows the script digest, interpreter, and the declared Secret Names: `BITBUCKET_ACCESS_TOKEN` alone for the tracked launcher, or that name plus every mapped name and `--allow-missing-keys` for the rendered copy.
 Without `--endorse-launcher` the Blessing still requires approval on every run; the endorsement lets one exact Verified Launcher use automatic authorization for this script.
-It covers every operation the launcher permits: any Bitbucket Cloud API read and pull-request creation, never a merge.
+It covers every operation the launcher permits: any Bitbucket Cloud API read, pull-request creation, and replies under existing pull-request comments, never a merge.
 Confirm in the Automic Vault app's Blessed Scripts view that it is the app that runs this home's firstmate session and its background monitoring; that view can also narrow, replace, or revoke the Blessing.
 If background calls still prompt, compare the launcher `av history` records for the prompting request with the endorsed one.
 

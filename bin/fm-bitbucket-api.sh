@@ -3,11 +3,18 @@
 #
 # Usage: fm-bitbucket-api.sh GET <api-path>
 #        fm-bitbucket-api.sh POST /2.0/repositories/<workspace>/<repository>/pullrequests <json-file>
+#        fm-bitbucket-api.sh POST /2.0/repositories/<workspace>/<repository>/pullrequests/<n>/comments <json-file>
+#        fm-bitbucket-api.sh reply <pull-request-url> <comment-id> <message>
 #        fm-bitbucket-api.sh render-launcher
 #
 # GET reads any relative Bitbucket Cloud v2 path beginning with /2.0/. POST
-# only creates a pull request from a JSON body file. The response body is
-# written to stdout and curl errors to stderr.
+# only creates a pull request, or posts a reply under an existing pull-request
+# comment, from a JSON body file; the launcher bin/fm-bitbucket-av.sh owns the
+# exact accepted paths and body shapes. reply builds that reply body for the
+# canonical https://bitbucket.org/<workspace>/<repository>/pull-requests/<n>
+# URL, the parent comment's numeric id, and the message text, then posts it
+# through POST. The response body is written to stdout and curl errors to
+# stderr.
 #
 # Each request authenticates with one Secret Name. A request whose path is
 # /2.0/repositories/<workspace>/<repository> or beneath it uses the name mapped
@@ -142,8 +149,34 @@ render_launcher() {
   printf 'bless it: av bless --endorse-launcher %s\n' "$HOME_LAUNCHER"
 }
 
+# reply_comment <pull-request-url> <comment-id> <message> posts the reply
+# through this helper's own POST path and removes its body file.
+reply_comment() {
+  local body api_path status=0
+  # shellcheck source=bin/fm-pr-lib.sh
+  . "$SCRIPT_DIR/fm-pr-lib.sh"
+  if ! fm_pr_url_parse "$1" || [ "$FM_PR_PROVIDER" != bitbucket ]; then
+    die 'reply needs a canonical https://bitbucket.org/<workspace>/<repository>/pull-requests/<n> URL'
+  fi
+  [[ "$2" =~ ^[1-9][0-9]{0,14}$ ]] || die 'comment id must be a positive integer'
+  command -v jq >/dev/null 2>&1 || die 'jq is required to build a comment reply'
+  api_path=$(fm_pr_bitbucket_api_path "$FM_PR_OWNER" "$FM_PR_REPO" "$FM_PR_NUMBER" /comments) \
+    || die 'reply could not derive the pull-request comment path'
+  body=$(mktemp "${TMPDIR:-/tmp}/fm-bitbucket-reply.XXXXXX")
+  jq -cS -n --arg raw "$3" --argjson id "$2" '{content:{raw:$raw},parent:{id:$id}}' > "$body" \
+    && "$SCRIPT_DIR/fm-bitbucket-api.sh" POST "$api_path" "$body" || status=$?
+  rm -f "$body"
+  return "$status"
+}
+
 case "${1:-}" in
   GET|POST) ;;
+  reply)
+    [ "$#" -eq 4 ] || die 'reply takes a pull-request URL, a comment id, and a message'
+    shift
+    reply_comment "$@"
+    exit
+    ;;
   render-launcher)
     [ "$#" -eq 1 ] || die 'render-launcher takes no arguments'
     render_launcher
