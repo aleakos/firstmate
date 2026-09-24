@@ -831,6 +831,7 @@ test_bitbucket_merged_pr_allows_cleanup() {
   printf '%s\n' \
     'pr=https://bitbucket.org/workspace/repository/pull-requests/7' \
     "pr_head=$head" >> "$case_dir/state/task-x1.meta"
+  seed_backlog_in_flight "$case_dir"
   cat > "$case_dir/fakebin/curl" <<SH
 #!/usr/bin/env bash
 cat >/dev/null
@@ -847,7 +848,13 @@ SH
   assert_no_grep 'REFUSED' "$case_dir/stderr" \
     "bitbucket-merged: cleanup refused a confirmed merged Bitbucket pull request"
   [ ! -e "$case_dir/state/task-x1.meta" ] || fail "bitbucket-merged: cleanup left task metadata"
-  pass "cleanup verifies a Bitbucket Cloud merged pull request and its exact landed head"
+  [ "$(backlog_row_state "$case_dir")" = "done" ] \
+    || fail "bitbucket-merged: cleanup left the backlog item $(backlog_row_state "$case_dir")"
+  assert_grep 'PR https://bitbucket.org/workspace/repository/pull-requests/7' "$case_dir/data/backlog.md" \
+    "bitbucket-merged: the closed backlog item did not record the Bitbucket pull request"
+  assert_absent "$case_dir/state/task-x1.backlog-close" \
+    "bitbucket-merged: the landed close left its pending-close record behind"
+  pass "cleanup verifies a Bitbucket Cloud merged pull request, its exact landed head, and closes the backlog item with its URL"
 }
 
 test_squash_merged_branch_deleted_allows() {

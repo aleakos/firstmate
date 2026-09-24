@@ -562,16 +562,40 @@ fm_backlog_start() {  # <data-dir> <id>
   fm_backlog_mutate "$1" start "$2"
 }
 
+# tasks-axi's pr link accepts only a URL ending in /pull/<number>. Any other
+# forge's pull request, such as a Bitbucket Cloud /pull-requests/<number> URL,
+# is recorded as the task body line `PR <url>` instead, the same deliverable
+# line fm_backlog_retain writes. The pending-close record keeps the `--pr` flag,
+# so teardown and its crash replay both translate here identically.
+fm_backlog_pr_link_accepted() {  # <url>
+  local number
+  case "${1-}" in
+    http://*/pull/*|https://*/pull/*) number=${1##*/pull/} ;;
+    *) return 1 ;;
+  esac
+  case "$number" in ''|*[!0-9]*) return 1 ;; esac
+}
+
 fm_backlog_done() {  # <data-dir> <id> [flag...]
-  local data=$1 id=$2
+  local data=$1 id=$2 arg previous_arg=''
+  local -a done_args=()
   shift 2
-  fm_backlog_mutate "$data" "done" "$id" "$@"
+  for arg in "$@"; do
+    if [ "$previous_arg" = --pr ] && ! fm_backlog_pr_link_accepted "$arg"; then
+      done_args[${#done_args[@]}-1]=--note
+      done_args+=("PR $arg")
+    else
+      done_args+=("$arg")
+    fi
+    previous_arg=$arg
+  done
+  fm_backlog_mutate "$data" "done" "$id" "${done_args[@]+"${done_args[@]}"}"
 }
 
 fm_backlog_row_artifact_supported() {
   local id=$1 flag=${2:-} value=${3:-}
   case "$flag" in
-    --pr) return 0 ;;
+    --pr) fm_backlog_pr_link_accepted "$value" ;;
     --report) [ "$value" = "data/$id/report.md" ] ;;
     *) return 1 ;;
   esac
@@ -604,7 +628,9 @@ fm_backlog_retain() {  # <data-dir> <id> [flag...]
         ;;
       --pr)
         deliverable="${deliverable:+$deliverable; }PR $arg"
-        row_args=(--pr "$arg")
+        if fm_backlog_row_artifact_supported "$id" --pr "$arg"; then
+          row_args=(--pr "$arg")
+        fi
         ;;
       --note) deliverable="${deliverable:+$deliverable; }$arg" ;;
     esac

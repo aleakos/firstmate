@@ -2029,6 +2029,26 @@ test_recovery_replays_a_close_an_interrupted_cleanup_left_open() {
   pass "session start finishes a close an interrupted cleanup recorded but never landed"
 }
 
+test_recovery_replays_a_bitbucket_close_as_a_body_link() {
+  local case_dir id out
+  id=atomic-heal-bitbucket-b9
+  case_dir=$(make_home heal-bitbucket-close)
+  add_item "$case_dir" "$id"
+  start_item "$case_dir" "$id"
+  printf 'id=%s\ndata=%s\nspawn_gen=spawn-heal-bitbucket\narg=--pr\narg=https://bitbucket.org/workspace/repository/pull-requests/17\n' \
+    "$id" "$(home_of "$case_dir")/data" \
+    > "$(home_of "$case_dir")/state/$id.backlog-close"
+
+  out=$(run_bootstrap "$case_dir")
+  [ "$(row_state "$case_dir" "$id")" = "done" ] \
+    || fail "session start left an interrupted Bitbucket cleanup's item at $(row_state "$case_dir" "$id"): $out"
+  assert_grep 'PR https://bitbucket.org/workspace/repository/pull-requests/17' "$(backlog_of "$case_dir")" \
+    "the replayed close dropped the Bitbucket pull request the cleanup had recorded"
+  assert_absent "$(home_of "$case_dir")/state/$id.backlog-close" \
+    "a replayed Bitbucket close left its record behind"
+  pass "session start replays a Bitbucket Cloud close with the pull request kept on the task"
+}
+
 test_recovery_backfills_a_recorded_link_on_an_already_done_item() {
   local case_dir id marker out
   id=atomic-heal-done-backfill-b9
@@ -3053,6 +3073,7 @@ test_recovery_marks_an_owned_record_in_flight
 test_recovery_rejects_an_internal_worker_record_symlink
 test_recovery_ignores_a_symlinked_worker_record
 test_recovery_replays_a_close_an_interrupted_cleanup_left_open
+test_recovery_replays_a_bitbucket_close_as_a_body_link
 test_recovery_backfills_a_recorded_link_on_an_already_done_item
 test_recovery_preserves_a_close_when_the_backlog_cannot_be_read
 test_recovery_retry_preserves_incomplete_cleanup_warning
