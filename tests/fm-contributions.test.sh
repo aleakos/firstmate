@@ -160,8 +160,8 @@ registered_checks() {
   done
 }
 
-bitbucket_forge_home() { # home [pull-request source hash]
-  local home=$1 source_hash=${2:-$HEAD_A}
+bitbucket_forge_home() { # home [pull-request source hash] [pull-request state]
+  local home=$1 source_hash=${2:-$HEAD_A} pr_state=${3:-OPEN}
   mkdir -p "$home/forge" "$home/root/bin" "$home/wt"
   printf '#!/bin/sh\nexit 0\n' > "$home/root/bin/fm-guard.sh"
   chmod +x "$home/root/bin/fm-guard.sh"
@@ -170,6 +170,7 @@ bitbucket_forge_home() { # home [pull-request source hash]
   cat > "$home/fakebin/curl" <<SH
 #!/usr/bin/env bash
 config=\$(cat)
+printf 'call\n' >> "$home/forge/calls"
 case "\$config" in
   *'/pullrequests/12/comments?pagelen=100'*)
     printf '%s\n' '{"values":[{"id":9,"deleted":false,"user":{"uuid":"{reviewer}","nickname":"maintainer"},"updated_on":"2026-09-16T08:01:00Z","content":{"raw":"Please adjust this"},"links":{"html":{"href":"https://bitbucket.org/workspace/repository/pull-requests/12#comment-9"}}}],"next":null}' ;;
@@ -178,7 +179,7 @@ case "\$config" in
   *'/commit/aaaaaaaaaaaa'*)
     printf '%s\n' '{"hash":"$HEAD_A"}' ;;
   *'/pullrequests/12'*)
-    printf '%s\n' '{"id":12,"state":"OPEN","draft":false,"task_count":0,"queued":false,"source":{"commit":{"hash":"$source_hash"}},"author":{"uuid":"{author}"},"reviewers":[{"uuid":"{reviewer}"}],"participants":[{"role":"REVIEWER","approved":true,"state":"approved","participated_on":"2026-09-16T07:59:00Z","user":{"uuid":"{reviewer}","nickname":"maintainer"}}],"links":{"html":{"href":"https://bitbucket.org/workspace/repository/pull-requests/12"}}}' ;;
+    printf '%s\n' '{"id":12,"state":"$pr_state","draft":false,"task_count":0,"queued":false,"source":{"commit":{"hash":"$source_hash"}},"author":{"uuid":"{author}"},"reviewers":[{"uuid":"{reviewer}"}],"participants":[{"role":"REVIEWER","approved":true,"state":"approved","participated_on":"2026-09-16T07:59:00Z","user":{"uuid":"{reviewer}","nickname":"maintainer"}}],"links":{"html":{"href":"https://bitbucket.org/workspace/repository/pull-requests/12"}}}' ;;
   *) printf 'unexpected Bitbucket fixture call\n' >&2; exit 1 ;;
 esac
 SH
@@ -220,6 +221,40 @@ test_bitbucket_abbreviated_head_observation() {
     "$home/data/bitbucket/contributions.json" >/dev/null \
     || fail 'abbreviated Bitbucket head was not resolved to its full hash for the observation'
   pass 'Bitbucket Cloud abbreviated pull-request heads resolve to the full hash and still surface reviewer comments'
+}
+
+test_bitbucket_terminal_pull_request_settles() {
+  local state expected home out later=2026-09-17T08:00:00Z
+  for state in DECLINED SUPERSEDED MERGED; do
+    expected=closed
+    [ "$state" != MERGED ] || expected=merged
+    home=$(new_home "bitbucket-terminal-$state")
+    bitbucket_forge_home "$home" aaaaaaaaaaaa "$state"
+    # The last good observation is open and a failed read left an error beside it.
+    mkdir -p "$home/data/bitbucket"
+    jq -n --arg head "$HEAD_A" '{schema:"fm-contributions.v1",task:"bitbucket",records:[{
+      url:"https://bitbucket.org/workspace/repository/pull-requests/12",kind:"pr",
+      checked_at:"2026-09-15T08:00:00Z",error:"forge observation unavailable or changed during read",
+      pending:[],seen:[],notified:[],verdict:null,
+      observation:{head:$head,state:"open",draft:false,mergeable:"unknown",can_merge:false,
+        review_decision:"REVIEW_REQUIRED",reviews:[],checks:[],events:[],absent_checks:[]}}]}' \
+      > "$home/data/bitbucket/contributions.json"
+    BITBUCKET_ACCESS_TOKEN=test-token with_home "$home" "$ROOT/bin/fm-contributions.sh" poll >/dev/null \
+      || fail "could not observe a $state Bitbucket Cloud pull request"
+    jq -e --arg now "$NOW" --arg head "$HEAD_A" --arg state "$expected" '.records[0] | .checked_at == $now
+      and .error == null and .observation.state == $state and .observation.head == $head' \
+      "$home/data/bitbucket/contributions.json" >/dev/null \
+      || fail "a $state Bitbucket pull request was not observed once as $expected: $(cat "$home/data/bitbucket/contributions.json")"
+    cp "$home/data/bitbucket/contributions.json" "$home/prior.json"
+    : > "$home/forge/calls"
+    out=$(BITBUCKET_ACCESS_TOKEN=test-token with_home "$home" env FM_CONTRIBUTIONS_NOW="$later" \
+      "$ROOT/bin/fm-contributions.sh" poll) || fail "poll after a $state Bitbucket observation failed"
+    [ -z "$out" ] || fail "a settled $state Bitbucket pull request printed: $out"
+    [ ! -s "$home/forge/calls" ] || fail "a settled $state Bitbucket pull request was re-read"
+    cmp -s "$home/prior.json" "$home/data/bitbucket/contributions.json" \
+      || fail "a settled $state Bitbucket record changed: $(cat "$home/data/bitbucket/contributions.json")"
+  done
+  pass 'a declined, superseded, or merged Bitbucket Cloud pull request settles once, clears its error, and is not re-read'
 }
 
 test_incoming_signal() { # comment|review|inline
@@ -896,7 +931,7 @@ test_late_owner_keeps_failure_episode_suppressed() {
 }
 
 failures=0
-for test_name in test_actor_coverage test_bitbucket_pull_request_observation test_bitbucket_abbreviated_head_observation test_stale_verdict test_unchecked_is_not_silence test_newest_check_has_no_verdict test_comment_wake test_review_wake test_inline_wake test_ready_issue_wake test_fresh_issue_requires_maintainer test_missing_lane_remains_missing test_partial_freshness_keeps_measured_rows test_malformed_record_cannot_prove_silence test_issue_timeline_and_exact_ack test_verdict_retains_judged_head test_observed_replacement_refreshes_verdict test_unobserved_head_leaves_verdict_unknown test_away_yolo_is_fleet_work test_away_yolo_cross_home_is_fleet_work test_retired_and_unsupported_coverage test_unsupported_forge_is_not_fleet_work test_held_unsupported_forge_is_not_captain_work test_shared_contribution_signal_wakes_once test_watcher_keeps_diagnostics_separate_from_contribution_wakes test_expired_child_unsupported_forge_stays_unmeasured test_watcher_surfaces_new_contribution_once test_home_summary_coverage test_unreadable_pending_is_not_empty test_budget_refusal_between_calls test_budget_bounded_call_timeout test_genuine_failure_near_deadline_is_unavailable test_shared_url_observed_once test_terminal_contribution_settles test_late_owner_inherits_terminal_observation test_done_task_open_pr_still_observed test_reservation_defers_later_url_when_fifteen_seconds_do_not_remain test_three_second_pr_reads_complete_fresh_in_one_cycle test_unavailable_forge_records_error_and_wakes_once_per_episode test_late_owner_keeps_failure_episode_suppressed; do
+for test_name in test_actor_coverage test_bitbucket_pull_request_observation test_bitbucket_abbreviated_head_observation test_bitbucket_terminal_pull_request_settles test_stale_verdict test_unchecked_is_not_silence test_newest_check_has_no_verdict test_comment_wake test_review_wake test_inline_wake test_ready_issue_wake test_fresh_issue_requires_maintainer test_missing_lane_remains_missing test_partial_freshness_keeps_measured_rows test_malformed_record_cannot_prove_silence test_issue_timeline_and_exact_ack test_verdict_retains_judged_head test_observed_replacement_refreshes_verdict test_unobserved_head_leaves_verdict_unknown test_away_yolo_is_fleet_work test_away_yolo_cross_home_is_fleet_work test_retired_and_unsupported_coverage test_unsupported_forge_is_not_fleet_work test_held_unsupported_forge_is_not_captain_work test_shared_contribution_signal_wakes_once test_watcher_keeps_diagnostics_separate_from_contribution_wakes test_expired_child_unsupported_forge_stays_unmeasured test_watcher_surfaces_new_contribution_once test_home_summary_coverage test_unreadable_pending_is_not_empty test_budget_refusal_between_calls test_budget_bounded_call_timeout test_genuine_failure_near_deadline_is_unavailable test_shared_url_observed_once test_terminal_contribution_settles test_late_owner_inherits_terminal_observation test_done_task_open_pr_still_observed test_reservation_defers_later_url_when_fifteen_seconds_do_not_remain test_three_second_pr_reads_complete_fresh_in_one_cycle test_unavailable_forge_records_error_and_wakes_once_per_episode test_late_owner_keeps_failure_episode_suppressed; do
   ( "$test_name" ) || failures=$((failures + 1))
 done
 [ "$failures" -eq 0 ] || fail "$failures contribution regressions"
