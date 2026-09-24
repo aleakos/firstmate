@@ -24,6 +24,9 @@ make_fake_curl() {
 config=$(cat)
 [ -z "${BITBUCKET_ACCESS_TOKEN:-}" ] || { printf 'provider token leaked into curl environment\n' >&2; exit 90; }
 [ -z "${FM_BB_TOKEN:-}" ] || { printf 'launcher token leaked into curl environment\n' >&2; exit 89; }
+for name in ${FM_TEST_SECRET_NAMES:-}; do
+  [ -z "${!name:-}" ] || { printf '%s leaked into curl environment\n' "$name" >&2; exit 88; }
+done
 printf '%s\n' "$*" > "$FM_TEST_CURL_ARGS"
 printf '%s\n' "$config" > "$FM_TEST_CURL_CONFIG"
 case "$config" in
@@ -41,7 +44,9 @@ run_api() {
   FM_TEST_CURL_ARGS="$dir/curl.args" \
   FM_TEST_CURL_CONFIG="$dir/curl.config" \
   FM_TEST_CURL_RESPONSE="$dir/response.json" \
-  FM_TEST_EXPECT_TOKEN="$TOKEN" \
+  FM_TEST_EXPECT_TOKEN="${FM_TEST_EXPECT_TOKEN:-$TOKEN}" \
+  FM_TEST_AV_VALUE_BITBUCKET_ACCESS_TOKEN="${FM_TEST_AV_VALUE_BITBUCKET_ACCESS_TOKEN-$TOKEN}" \
+  FM_CONFIG_OVERRIDE="${FM_CONFIG_OVERRIDE:-$dir/home/config}" \
   PATH="$dir/fakebin:$BASE_PATH" \
     "$API" "$@"
 }
@@ -81,8 +86,10 @@ test_home_env_token_never_enters_arguments() {
   pass "Bitbucket API reads the active home's gitignored token without argument leakage"
 }
 
-# make_fake_av <dir>: stands in for Automic Vault executing the launcher's
-# shebang, `av inject +BITBUCKET_ACCESS_TOKEN /bin/sh <launcher> ...`.
+# make_fake_av <dir>: stands in for Automic Vault executing a launcher's
+# shebang, `av inject [--allow-missing-keys] +KEY... /bin/sh <launcher> ...`.
+# Each +KEY receives FM_TEST_AV_VALUE_<KEY>; an unset one fails unless
+# --allow-missing-keys leaves it unset, as the real av does.
 make_fake_av() {
   local dir=$1
   mkdir -p "$dir/fakebin"
@@ -90,10 +97,23 @@ make_fake_av() {
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_AV_LOG"
 [ "${1:-}" = inject ] || exit 92
-[ "${2:-}" = +BITBUCKET_ACCESS_TOKEN ] || exit 93
-[ "${3:-}" = /bin/sh ] || exit 94
-shift 2
-BITBUCKET_ACCESS_TOKEN="$FM_TEST_EXPECT_TOKEN" exec "$@"
+shift
+allow_missing=0
+if [ "${1:-}" = --allow-missing-keys ]; then allow_missing=1; shift; fi
+keys=()
+while [ "${1#+}" != "${1:-}" ]; do keys+=("${1#+}"); shift; done
+[ "${#keys[@]}" -gt 0 ] || exit 93
+[ "${1:-}" = /bin/sh ] || exit 94
+for key in "${keys[@]}"; do
+  value_var="FM_TEST_AV_VALUE_$key"
+  if [ -n "${!value_var:-}" ]; then
+    export "$key=${!value_var}"
+  elif [ "$allow_missing" -eq 0 ]; then
+    printf 'av inject: failed to load secret %s\n' "$key" >&2
+    exit 95
+  fi
+done
+exec "$@"
 SH
   chmod +x "$dir/fakebin/av"
 }
@@ -111,7 +131,7 @@ test_vault_injection_names_only_the_secret() {
 
   assert_contains "$out" '"uuid":"{repository}"' "vault token: API response was not relayed"
   assert_equals "$(cat "$dir/av.log")" \
-    "inject +BITBUCKET_ACCESS_TOKEN /bin/sh $LAUNCHER GET /2.0/repositories/workspace/repository" \
+    "inject +BITBUCKET_ACCESS_TOKEN /bin/sh $LAUNCHER --secret BITBUCKET_ACCESS_TOKEN GET /2.0/repositories/workspace/repository" \
     "vault token: API helper did not route Automic Vault through the blessable launcher"
   assert_no_grep "$TOKEN" "$dir/av.log" "vault token: credential leaked into Automic Vault arguments"
   assert_not_contains "$(cat "$dir/curl.args")" "$TOKEN" \
@@ -250,6 +270,196 @@ test_launcher_check_and_stdin_modes_keep_the_token_private() {
   [ "$rc" -eq 1 ] || fail "launcher ran without a Vault-supplied token (exit $rc)"
   assert_absent "$dir/empty.args" "launcher invoked curl without a token"
   pass "Bitbucket launcher validates without a token and keeps stdin tokens out of curl's arguments and environment"
+}
+
+REPO_TOKEN='test-amr-engine-token-not-a-real-secret'
+
+# write_repo_tokens <home>: maps one repository to its own Secret Name.
+write_repo_tokens() {
+  mkdir -p "$1/config"
+  printf '%s\n' '# repository access tokens' \
+    'eavortechnologies/amr-engine AMR_BB_FIRSTMATE  # bot identity' \
+    '' 'eavortechnologies/agent-factory AGENT_FACTORY_BB_FIRSTMATE' \
+    > "$1/config/bitbucket-repo-tokens"
+}
+
+test_render_launcher_declares_every_mapped_secret() {
+  local dir out expected
+  dir="$TMP_ROOT/render-launcher"
+  mkdir -p "$dir/home"
+  write_repo_tokens "$dir/home"
+
+  out=$(FM_HOME="$dir/home" run_api "$dir" render-launcher)
+  assert_contains "$out" "changed $dir/home/config/bitbucket-av.sh" \
+    "render: helper did not report the rendered per-home launcher"
+  assert_contains "$out" "av bless --endorse-launcher $dir/home/config/bitbucket-av.sh" \
+    "render: helper did not print the re-bless command"
+  expected='#!/usr/local/bin/av inject --allow-missing-keys +AGENT_FACTORY_BB_FIRSTMATE +AMR_BB_FIRSTMATE +BITBUCKET_ACCESS_TOKEN /bin/sh'
+  assert_equals "$(head -n 1 "$dir/home/config/bitbucket-av.sh")" "$expected" \
+    "render: shebang does not declare exactly the default and mapped Secret Names"
+  assert_equals "$(tail -n +2 "$dir/home/config/bitbucket-av.sh")" "$(tail -n +2 "$LAUNCHER")" \
+    "render: per-home launcher body differs from the tracked launcher"
+
+  out=$(FM_HOME="$dir/home" run_api "$dir" render-launcher)
+  assert_equals "$out" "unchanged $dir/home/config/bitbucket-av.sh" \
+    "render: an unchanged mapping rewrote the blessed launcher"
+  pass "render-launcher writes a per-home launcher declaring every mapped Secret Name and is idempotent"
+}
+
+test_mapped_repository_uses_its_own_vault_secret() {
+  local dir out home_launcher
+  dir="$TMP_ROOT/repo-token-vault"
+  mkdir -p "$dir/home"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  write_repo_tokens "$dir/home"
+  home_launcher="$dir/home/config/bitbucket-av.sh"
+  FM_HOME="$dir/home" run_api "$dir" render-launcher > /dev/null
+  printf '%s\n' '{"state":"OPEN"}' > "$dir/response.json"
+  printf '%s\n' '{"title":"t"}' > "$dir/body.json"
+
+  out=$(FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+    FM_TEST_AV_VALUE_AMR_BB_FIRSTMATE="$REPO_TOKEN" FM_TEST_EXPECT_TOKEN="$REPO_TOKEN" \
+    FM_TEST_SECRET_NAMES='AMR_BB_FIRSTMATE BITBUCKET_ACCESS_TOKEN' \
+    run_api "$dir" GET /2.0/repositories/EavorTechnologies/AMR-Engine/pullrequests/7)
+  assert_contains "$out" '"state":"OPEN"' "repo token: API response was not relayed"
+  assert_equals "$(cat "$dir/av.log")" \
+    "inject --allow-missing-keys +AGENT_FACTORY_BB_FIRSTMATE +AMR_BB_FIRSTMATE +BITBUCKET_ACCESS_TOKEN /bin/sh $home_launcher --secret AMR_BB_FIRSTMATE GET /2.0/repositories/EavorTechnologies/AMR-Engine/pullrequests/7" \
+    "repo token: helper did not run the rendered launcher exactly as its shebang declares"
+  assert_contains "$(cat "$dir/curl.config")" "Authorization: Bearer $REPO_TOKEN" \
+    "repo token: mapped repository did not authenticate with its own Secret"
+
+  rm -f "$dir/av.log"
+  FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+    FM_TEST_AV_VALUE_AMR_BB_FIRSTMATE="$REPO_TOKEN" FM_TEST_EXPECT_TOKEN="$REPO_TOKEN" \
+    FM_TEST_SECRET_NAMES='AMR_BB_FIRSTMATE BITBUCKET_ACCESS_TOKEN' \
+    run_api "$dir" POST /2.0/repositories/eavortechnologies/amr-engine/pullrequests "$dir/body.json" > /dev/null
+  assert_contains "$(cat "$dir/curl.config")" "Authorization: Bearer $REPO_TOKEN" \
+    "repo token: pull-request creation did not use the repository's own Secret"
+
+  for path in /2.0/user /2.0/repositories/eavortechnologies/other/pullrequests/7 \
+    /2.0/repositories/eavortechnologies/amr-engine-fork/pullrequests/7; do
+    FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+      FM_TEST_AV_VALUE_AMR_BB_FIRSTMATE="$REPO_TOKEN" \
+      FM_TEST_SECRET_NAMES='AMR_BB_FIRSTMATE BITBUCKET_ACCESS_TOKEN' \
+      run_api "$dir" GET "$path" > /dev/null \
+      || fail "repo token: unmapped request $path failed"
+    assert_contains "$(cat "$dir/curl.config")" "Authorization: Bearer $TOKEN" \
+      "repo token: unmapped request $path did not use BITBUCKET_ACCESS_TOKEN"
+  done
+  assert_no_grep "$REPO_TOKEN" "$dir/av.log" "repo token: credential leaked into Automic Vault arguments"
+  pass "mapped repositories authenticate with their own Vault Secret while other requests keep the default"
+}
+
+test_mapped_repository_never_falls_back_to_default_token() {
+  local dir rc
+  dir="$TMP_ROOT/repo-token-missing"
+  mkdir -p "$dir/home"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  write_repo_tokens "$dir/home"
+  printf '%s\n' '{}' > "$dir/response.json"
+
+  set +e
+  FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN="$TOKEN" \
+    run_api "$dir" GET /2.0/repositories/eavortechnologies/amr-engine/pullrequests/7 \
+    > /dev/null 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || fail "unrendered mapping exited $rc instead of 2"
+  assert_absent "$dir/av.log" "unrendered mapping still asked Automic Vault"
+  assert_absent "$dir/curl.args" "unrendered mapping fell back to the default token"
+  assert_grep 'AMR_BB_FIRSTMATE is not declared' "$dir/stderr" "unrendered mapping was not diagnosed"
+  assert_grep 'render-launcher' "$dir/stderr" "unrendered mapping did not name the remedy"
+
+  FM_HOME="$dir/home" run_api "$dir" render-launcher > /dev/null
+  set +e
+  FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+    run_api "$dir" GET /2.0/repositories/eavortechnologies/amr-engine/pullrequests/7 \
+    > /dev/null 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -eq 1 ] || fail "missing mapped Vault Secret exited $rc instead of 1"
+  assert_absent "$dir/curl.args" "missing mapped Vault Secret fell back to the default token"
+  assert_grep 'AMR_BB_FIRSTMATE was not supplied' "$dir/stderr" "missing mapped Vault Secret was not named"
+  pass "a mapped repository refuses rather than falling back to BITBUCKET_ACCESS_TOKEN"
+}
+
+test_mapped_secret_environment_and_home_env_win_over_vault() {
+  local dir
+  dir="$TMP_ROOT/repo-token-precedence"
+  mkdir -p "$dir/home"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  write_repo_tokens "$dir/home"
+  printf '%s\n' '{}' > "$dir/response.json"
+
+  FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN="$TOKEN" \
+    AMR_BB_FIRSTMATE="$REPO_TOKEN" FM_TEST_EXPECT_TOKEN="$REPO_TOKEN" \
+    FM_TEST_SECRET_NAMES='AMR_BB_FIRSTMATE BITBUCKET_ACCESS_TOKEN' \
+    run_api "$dir" GET /2.0/repositories/eavortechnologies/amr-engine/pullrequests/7 > /dev/null \
+    || fail "mapped environment token: request failed"
+  printf '%s\n' "AMR_BB_FIRSTMATE=$REPO_TOKEN" "BITBUCKET_ACCESS_TOKEN=$TOKEN" > "$dir/home/.env"
+  FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+    FM_TEST_EXPECT_TOKEN="$REPO_TOKEN" \
+    run_api "$dir" GET /2.0/repositories/eavortechnologies/amr-engine/pullrequests/7 > /dev/null \
+    || fail "mapped home .env token: request failed"
+  assert_not_contains "$(cat "$dir/curl.args")" "$REPO_TOKEN" \
+    "mapped home .env token: credential leaked into curl process arguments"
+  assert_absent "$dir/av.log" "mapped local token still asked Automic Vault"
+  pass "a mapped Secret Name read from the environment or home .env wins over Automic Vault"
+}
+
+test_malformed_repo_tokens_refuse_before_vault_or_curl() {
+  local dir rc line
+  dir="$TMP_ROOT/repo-token-malformed"
+  mkdir -p "$dir/home/config"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  printf '%s\n' '{}' > "$dir/response.json"
+  while IFS= read -r line; do
+    printf '%s\n' "$line" > "$dir/home/config/bitbucket-repo-tokens"
+    set +e
+    FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN="$TOKEN" \
+      run_api "$dir" GET /2.0/user > /dev/null 2> "$dir/stderr"
+    rc=$?
+    set -e
+    [ "$rc" -eq 2 ] || fail "malformed mapping ($line) exited $rc instead of 2"
+    assert_absent "$dir/av.log" "malformed mapping ($line) still asked Automic Vault"
+    assert_absent "$dir/curl.args" "malformed mapping ($line) still invoked curl"
+  done <<'LINES'
+eavortechnologies/amr-engine
+eavortechnologies/amr-engine AMR_BB_FIRSTMATE extra
+amr-engine AMR_BB_FIRSTMATE
+eavortechnologies/../amr-engine AMR_BB_FIRSTMATE
+eavortechnologies/amr-engine 1BAD
+eavortechnologies/amr-engine BAD-NAME
+LINES
+  printf '%s\n' 'w/r A' 'W/R B' > "$dir/home/config/bitbucket-repo-tokens"
+  set +e
+  FM_HOME="$dir/home" run_api "$dir" GET /2.0/user > /dev/null 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || fail "duplicate mapping exited $rc instead of 2"
+  assert_grep 'more than once' "$dir/stderr" "duplicate mapping was not diagnosed"
+  pass "malformed or duplicate repository token mappings refuse before any Vault approval or network call"
+}
+
+test_launcher_refuses_undeclared_secret_names() {
+  local dir rc name
+  dir="$TMP_ROOT/launcher-secret"
+  mkdir -p "$dir"
+  make_fake_curl "$dir"
+  for name in PATH 'BAD;NAME' ''; do
+    set +e
+    BITBUCKET_ACCESS_TOKEN="$TOKEN" FM_TEST_CURL_ARGS="$dir/curl.args" PATH="$dir/fakebin:$BASE_PATH" \
+      /bin/sh "$LAUNCHER" --secret "$name" GET /2.0/user > /dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -eq 2 ] || fail "launcher accepted --secret '$name' (exit $rc)"
+    assert_absent "$dir/curl.args" "launcher sent a request for --secret '$name'"
+  done
+  pass "Bitbucket launcher refuses a Secret Name its shebang does not declare"
 }
 
 test_forge_detection_uses_exact_hosts() {
@@ -589,6 +799,12 @@ test_environment_and_home_env_win_over_vault
 test_pull_request_creation_posts_only_the_body_file
 test_invalid_requests_refuse_before_vault_or_curl
 test_launcher_check_and_stdin_modes_keep_the_token_private
+test_render_launcher_declares_every_mapped_secret
+test_mapped_repository_uses_its_own_vault_secret
+test_mapped_repository_never_falls_back_to_default_token
+test_mapped_secret_environment_and_home_env_win_over_vault
+test_malformed_repo_tokens_refuse_before_vault_or_curl
+test_launcher_refuses_undeclared_secret_names
 test_forge_detection_uses_exact_hosts
 test_url_parser_accepts_only_canonical_bitbucket_pull_requests
 test_poll_emits_only_exact_merged_state

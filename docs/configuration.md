@@ -557,6 +557,34 @@ Grant the token read access to the repositories, pull requests, comments, tasks,
 Use the narrowest repository or workspace scope that covers those operations.
 This token authenticates Firstmate's Bitbucket API calls; configure SSH or HTTPS Git credentials separately for clone, fetch, push, and pull-request branch refs.
 
+### Per-repository access tokens
+
+A Bitbucket repository access token acts as its own bot user, so pull requests that workers open with it are authored by that bot, and the operator can review them as a real reviewer whose comments the contribution follow-up counts.
+Map each such repository to the Secret Name holding its token in the optional gitignored `config/bitbucket-repo-tokens`, one `<workspace>/<repository> <SECRET_NAME>` line per repository, matched case-insensitively, with `#` starting a comment:
+
+```text
+eavortechnologies/amr-engine AMR_BB_FIRSTMATE
+eavortechnologies/agent-factory AGENT_FACTORY_BB_FIRSTMATE
+```
+
+A request for `/2.0/repositories/<workspace>/<repository>` or any path beneath it, including pull-request creation, then authenticates with the mapped name, read from the environment, then `.env`, then Automic Vault, under the same precedence as `BITBUCKET_ACCESS_TOKEN`.
+Every other request, such as the `/2.0/user` startup check, and every unmapped repository keep using `BITBUCKET_ACCESS_TOKEN`.
+A mapped repository never falls back to `BITBUCKET_ACCESS_TOKEN`: when its own token is unavailable the request fails rather than acting as the default token's user.
+A malformed or duplicate line refuses every request until it is fixed.
+The file is home-local and not inherited by secondmate homes.
+
+Create each repository access token in Bitbucket under the repository's Repository settings, Access tokens, with the scopes Repositories Read and Pull requests Read and Write, then store it without printing it:
+
+```sh
+av save AMR_BB_FIRSTMATE
+av save AGENT_FACTORY_BB_FIRSTMATE
+```
+
+Automic Vault serves only the Secret Names a blessed script's shebang declares, and it cannot choose a Secret at run time, so every mapped name must be listed in the blessed launcher.
+Keeping those names out of the tracked launcher, `<home>/bin/fm-bitbucket-api.sh render-launcher` writes a per-home copy, `config/bitbucket-av.sh`, whose shebang declares `BITBUCKET_ACCESS_TOKEN` and every mapped name with `--allow-missing-keys`, so a name not yet saved fails only the requests that select it.
+Once that copy exists, the helper runs Vault-backed requests through it instead of the tracked launcher.
+Adding, renaming, or removing a mapping therefore needs one `render-launcher` run and, when it reports `changed`, one new Blessing of that copy as described below; a mapping whose name the copy does not declare is refused with that remedy before Automic Vault is asked.
+
 The helper never puts the token in command arguments, repository files, state, or output.
 It supplies the `Authorization: Bearer` header to `curl` through standard-input configuration and fixes requests to Bitbucket Cloud's HTTPS API host.
 `GET` accepts any `/2.0/` path; the only write is `POST /2.0/repositories/<workspace>/<repository>/pullrequests` with a regular JSON body file of at most 1 MiB, which creates a pull request.
@@ -588,26 +616,35 @@ See [`docs/bitbucket-cloud.md`](bitbucket-cloud.md) for the maintainer-facing pa
 
 Without a Blessing, every Vault-backed call asks for a fresh Automic Vault approval, so background merge monitoring, contribution observation, and worker pull-request creation stop whenever no one approves.
 Blessing binds one reviewed launcher, so bless the home's own copy, not a task worktree's copy.
-As a one-time step after this launcher lands and the home has updated, review [`bin/fm-bitbucket-av.sh`](../bin/fm-bitbucket-av.sh) and run:
+Bless the rendered per-home copy when this home maps any repository, and the tracked launcher otherwise, because Vault-backed requests use the rendered copy whenever it exists.
+After this launcher lands and the home has updated, review [`bin/fm-bitbucket-av.sh`](../bin/fm-bitbucket-av.sh) and run either:
 
 ```sh
 av bless --endorse-launcher <home>/bin/fm-bitbucket-av.sh
 ```
 
-Automic Vault's review shows the script digest, interpreter, and the single Secret Name `BITBUCKET_ACCESS_TOKEN`.
+or, with `config/bitbucket-repo-tokens` in place:
+
+```sh
+<home>/bin/fm-bitbucket-api.sh render-launcher
+av bless --endorse-launcher <home>/config/bitbucket-av.sh
+```
+
+Automic Vault's review shows the script digest, interpreter, and the declared Secret Names: `BITBUCKET_ACCESS_TOKEN` alone for the tracked launcher, or that name plus every mapped name and `--allow-missing-keys` for the rendered copy.
 Without `--endorse-launcher` the Blessing still requires approval on every run; the endorsement lets one exact Verified Launcher use automatic authorization for this script.
 It covers every operation the launcher permits: any Bitbucket Cloud API read and pull-request creation, never a merge.
 Confirm in the Automic Vault app's Blessed Scripts view that it is the app that runs this home's firstmate session and its background monitoring; that view can also narrow, replace, or revoke the Blessing.
 If background calls still prompt, compare the launcher `av history` records for the prompting request with the endorsed one.
 
 The Blessing binds the launcher's path, file type, size, interpreter, declaration, and content.
-Editing, replacing, or moving `bin/fm-bitbucket-av.sh` invalidates it, and calls fall back to per-run approval until you review the diff and bless again.
+Editing, replacing, or moving the blessed file invalidates it, and calls fall back to per-run approval until you review the diff and bless again.
 Every other Firstmate script, including `bin/fm-bitbucket-api.sh`, can change without re-blessing, so after an update re-bless only when `git diff <previous-head> HEAD -- bin/fm-bitbucket-av.sh` is not empty.
+A rendered copy keeps running the launcher code it was rendered from until you rerun `render-launcher`, so after such an update rerun it and bless the copy again when it reports `changed`.
 An unexplained change is evidence to investigate, not a reason to re-bless.
 
 A locked Mac is separate from authorization.
 A Secret whose availability is When Unlocked cannot be read while the Mac is locked, so a request fails before any approval, for example with Keychain error `-25308`, even when the launcher is blessed.
-For unattended work, unlock the Mac, run `av open`, open Secrets, select `BITBUCKET_ACCESS_TOKEN`, and enable Available While Locked.
+For unattended work, unlock the Mac, run `av open`, open Secrets, select `BITBUCKET_ACCESS_TOKEN` and each mapped Secret Name, and enable Available While Locked on each.
 That setting still needs the first unlock after a restart and does not wake a sleeping or shut-down Mac.
 
 Verify the Blessing from the app that runs firstmate, with no token in this home's `.env`:
@@ -617,6 +654,7 @@ env -u BITBUCKET_ACCESS_TOKEN <home>/bin/fm-bitbucket-api.sh GET /2.0/repositori
 av history --since 10m
 ```
 
+For a mapped repository, also unset its Secret Name, for example `env -u BITBUCKET_ACCESS_TOKEN -u AMR_BB_FIRSTMATE`.
 The read must print the pull request's state without an approval prompt, and `av history` should show the request authorized by policy rather than by a human.
 Repeat the read with the Mac locked to confirm the Available While Locked setting.
 
@@ -1227,6 +1265,7 @@ FM_IMAP_PORT=993   # mail-plane IMAP server port
 FM_SMTP_HOST=      # mail-plane SMTP server hostname
 FM_SMTP_PORT=465   # mail-plane SMTP server port
 BITBUCKET_ACCESS_TOKEN= # Bitbucket Cloud bearer token, from environment or .env with Automic Vault fallback (docs/configuration.md "Bitbucket Cloud authentication")
+# <SECRET_NAME>= # optional per-repository token named in config/bitbucket-repo-tokens, same sources (docs/configuration.md "Per-repository access tokens")
 FMX_PAIRING_TOKEN=      # Relay pairing token; .env opt-in authorizes replies and eligible lifecycle actions
 FMX_RELAY_URL=https://myfirstmate.io   # optional Relay endpoint override, mainly for local relay development
 FMX_ENV_FILE=           # optional alternate .env file for direct Relay client invocations; bootstrap still checks $FM_HOME/.env

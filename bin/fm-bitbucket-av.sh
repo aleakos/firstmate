@@ -1,9 +1,9 @@
 #!/usr/local/bin/av inject +BITBUCKET_ACCESS_TOKEN /bin/sh
 # shellcheck shell=sh disable=SC2096 # macOS splits this documented Automic Vault shebang into its words.
-# Blessable Automic Vault launcher for the Bitbucket Cloud API token.
+# Blessable Automic Vault launcher for Bitbucket Cloud API tokens.
 #
-# Usage: fm-bitbucket-av.sh [--check|--token-stdin] GET <api-path>
-#        fm-bitbucket-av.sh [--check|--token-stdin] POST <pullrequests-path> <json-file>
+# Usage: fm-bitbucket-av.sh [--check|--token-stdin] [--secret NAME] GET <api-path>
+#        fm-bitbucket-av.sh [--check|--token-stdin] [--secret NAME] POST <pullrequests-path> <json-file>
 #
 # GET accepts any relative Bitbucket Cloud v2 path beginning with /2.0/.
 # POST accepts only /2.0/repositories/<workspace>/<repository>/pullrequests,
@@ -11,11 +11,16 @@
 # Requests go only to https://api.bitbucket.org; the response body is written
 # to stdout and curl errors to stderr.
 #
-# Run directly, the shebang asks Automic Vault to inject BITBUCKET_ACCESS_TOKEN.
+# Run directly, the shebang asks Automic Vault to inject every Secret Name it
+# declares; this tracked copy declares only BITBUCKET_ACCESS_TOKEN. --secret
+# selects which declared Secret authenticates this request (default
+# BITBUCKET_ACCESS_TOKEN) and refuses a name the shebang does not declare.
+# bin/fm-bitbucket-api.sh owns the repository-to-Secret mapping and renders a
+# per-home copy whose shebang declares the mapped names.
 # --token-stdin reads the token from the first stdin line instead, and --check
 # validates the request and exits without reading any token or calling curl.
 # The token reaches curl only through its stdin config, never argv, a child
-# environment, or a file.
+# environment, or a file; every declared Secret Name is unset before curl runs.
 #
 # This file is self-contained so an Automic Vault Blessing of it stays valid
 # across ordinary Firstmate updates. Any edit, move, or mode change requires a
@@ -39,11 +44,30 @@ safe_slug() {
   esac
 }
 
+safe_name() {
+  case "$1" in
+    ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) return 1 ;;
+  esac
+}
+
+# declared_names prints the +KEY names of this script's own av inject shebang.
+# AV_SCRIPT_PATH names the canonical source while av runs a verified snapshot.
+declared_names() {
+  sed -n '1{s/^#!//;p;}' "${AV_SCRIPT_PATH:-$0}" | tr -s ' \t' '\n' \
+    | sed -n 's/^+\([A-Za-z_][A-Za-z0-9_]*\)$/\1/p'
+}
+
 MODE=inject
 case "${1:-}" in
   --check|--token-stdin) MODE=${1#--}; shift ;;
 esac
-[ "$#" -ge 2 ] || die 'usage: fm-bitbucket-av.sh [--check|--token-stdin] GET <api-path> | POST <pullrequests-path> <json-file>'
+SECRET=BITBUCKET_ACCESS_TOKEN
+if [ "${1:-}" = --secret ]; then
+  if [ "$#" -lt 2 ] || ! safe_name "$2"; then die 'invalid --secret name'; fi
+  SECRET=$2
+  shift 2
+fi
+[ "$#" -ge 2 ] || die 'usage: fm-bitbucket-av.sh [--check|--token-stdin] [--secret NAME] GET <api-path> | POST <pullrequests-path> <json-file>'
 METHOD=$1
 API_PATH=$2
 BODY=
@@ -74,20 +98,26 @@ case "$METHOD" in
 esac
 [ "$MODE" != check ] || exit 0
 
+DECLARED=$(declared_names)
 # Clear any inherited copy so the assignment below stays unexported.
 unset FM_BB_TOKEN
 if [ "$MODE" = token-stdin ]; then
   IFS= read -r FM_BB_TOKEN || [ -n "${FM_BB_TOKEN:-}" ] || FM_BB_TOKEN=
 else
-  FM_BB_TOKEN=${BITBUCKET_ACCESS_TOKEN:-}
+  printf '%s\n' "$DECLARED" | grep -qx "$SECRET" \
+    || die "$SECRET is not declared by this launcher's shebang"
+  # SECRET passed safe_name, so this expansion reads exactly that variable.
+  eval "FM_BB_TOKEN=\${$SECRET:-}"
 fi
-unset BITBUCKET_ACCESS_TOKEN
+for name in $DECLARED BITBUCKET_ACCESS_TOKEN; do
+  unset "$name"
+done
 [ -n "$FM_BB_TOKEN" ] || {
-  printf 'fm-bitbucket-av: BITBUCKET_ACCESS_TOKEN was not supplied\n' >&2
+  printf 'fm-bitbucket-av: %s was not supplied\n' "$SECRET" >&2
   exit 1
 }
 safe_text "$FM_BB_TOKEN" || {
-  printf 'fm-bitbucket-av: BITBUCKET_ACCESS_TOKEN has an unsafe value\n' >&2
+  printf 'fm-bitbucket-av: %s has an unsafe value\n' "$SECRET" >&2
   exit 1
 }
 command -v curl >/dev/null 2>&1 || {

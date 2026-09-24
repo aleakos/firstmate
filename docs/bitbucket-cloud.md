@@ -18,13 +18,18 @@ The corresponding API identity is fixed beneath `https://api.bitbucket.org/2.0/r
 ## Credential boundary
 
 `bin/fm-bitbucket-api.sh` is the only bearer-authenticated Bitbucket client entry point, and every request it makes runs through the self-contained launcher `bin/fm-bitbucket-av.sh`, which owns request validation and the curl call.
-Credential precedence is the ambient `BITBUCKET_ACCESS_TOKEN`, then the home's gitignored `.env`, both handed to the launcher on standard input, then an Automic Vault run of the launcher exactly as its shebang declares:
+Each request selects one Secret Name: `BITBUCKET_ACCESS_TOKEN`, or, for a path at or beneath `/2.0/repositories/<workspace>/<repository>`, the name that repository maps to in the home's gitignored `config/bitbucket-repo-tokens`; the helper header owns the map format, and a mapped repository never falls back to the default name.
+Credential precedence for the selected name is the ambient environment, then the home's gitignored `.env`, both handed to the tracked launcher on standard input, then an Automic Vault run of the Vault launcher exactly as its shebang declares:
 
 ```sh
-av inject +BITBUCKET_ACCESS_TOKEN /bin/sh bin/fm-bitbucket-av.sh ...
+av inject +BITBUCKET_ACCESS_TOKEN /bin/sh bin/fm-bitbucket-av.sh --secret BITBUCKET_ACCESS_TOKEN ...
 ```
 
-Keeping every Vault-backed request in that one rarely-changing file is what lets an operator bless it once; the operator procedure is in [configuration.md](configuration.md#blessing-the-automic-vault-launcher).
+Automic Vault matches a request to a Blessing only when its Secret Names and injection options equal the blessed shebang's, and a blessed script cannot request a Secret chosen at run time; file-descriptor delivery from inside a blessed script needs fresh approval on every run.
+A home that maps repositories therefore renders a per-home copy, `config/bitbucket-av.sh`, with `fm-bitbucket-api.sh render-launcher`: the tracked launcher's body under a shebang declaring `--allow-missing-keys`, `BITBUCKET_ACCESS_TOKEN`, and every mapped name, which keeps home-specific Secret Names out of the tracked file.
+The helper derives Automic Vault's arguments from the chosen launcher's own shebang, so the request always equals the declaration, and refuses a selected name that shebang does not declare before asking Automic Vault.
+The launcher's `--secret` selects among its declared names, refuses any other, and unsets every declared name before curl runs.
+Keeping every Vault-backed request in that one rarely-changing file is what lets an operator bless it once per mapping change; the operator procedure is in [configuration.md](configuration.md#blessing-the-automic-vault-launcher).
 The helper validates a request with the launcher's `--check` mode before choosing a credential source, so a refused request never prompts for Vault approval.
 Neither script places the token in argv, a child environment, or a temporary file.
 The launcher sends a curl configuration on standard input containing the fixed HTTPS URL, bearer header, method, and timeouts.
@@ -90,5 +95,5 @@ bin/fm-test-run.sh \
   tests/fm-bootstrap.test.sh
 ```
 
-The fixtures prove ambient-token, `.env`, and Automic Vault transport through the launcher without argv or environment leakage, source precedence, pull-request creation, refusal of invalid requests before any Vault approval or curl call, strict URL rejection, exact merged polling, head capture, state/blocker rendering, provider git-ref selection, contribution checks/reviews/comments, cleanup of a confirmed landed head, conditional GitHub tooling, conditional Bitbucket authentication diagnostics, refusal on red builds and head movement, and the no-atomic-head merge refusal.
+The fixtures prove ambient-token, `.env`, and Automic Vault transport through the launcher without argv or environment leakage, source precedence, per-repository Secret selection through the rendered launcher with no fallback to the default token, refusal of malformed mappings and undeclared Secret Names, pull-request creation, refusal of invalid requests before any Vault approval or curl call, strict URL rejection, exact merged polling, head capture, state/blocker rendering, provider git-ref selection, contribution checks/reviews/comments, cleanup of a confirmed landed head, conditional GitHub tooling, conditional Bitbucket authentication diagnostics, refusal on red builds and head movement, and the no-atomic-head merge refusal.
 The tests use byte-controlled fake API responses and do not claim live Bitbucket credentials or a live destructive merge.
