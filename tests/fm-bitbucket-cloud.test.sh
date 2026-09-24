@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Focused provider-contract tests for Bitbucket Cloud URL identity, Automic Vault
-# credential injection, direct API reads, and exact merged-state polling.
+# credential injection through the blessable launcher, direct API reads,
+# pull-request creation, and exact merged-state polling.
 set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 API="$ROOT/bin/fm-bitbucket-api.sh"
+LAUNCHER="$ROOT/bin/fm-bitbucket-av.sh"
 POLL="$ROOT/bin/fm-pr-poll.sh"
 PR_LIB="$ROOT/bin/fm-pr-lib.sh"
 PR_STATE="$ROOT/bin/fm-pr-state.sh"
@@ -21,6 +23,7 @@ make_fake_curl() {
 #!/usr/bin/env bash
 config=$(cat)
 [ -z "${BITBUCKET_ACCESS_TOKEN:-}" ] || { printf 'provider token leaked into curl environment\n' >&2; exit 90; }
+[ -z "${FM_BB_TOKEN:-}" ] || { printf 'launcher token leaked into curl environment\n' >&2; exit 89; }
 printf '%s\n' "$*" > "$FM_TEST_CURL_ARGS"
 printf '%s\n' "$config" > "$FM_TEST_CURL_CONFIG"
 case "$config" in
@@ -78,58 +81,175 @@ test_home_env_token_never_enters_arguments() {
   pass "Bitbucket API reads the active home's gitignored token without argument leakage"
 }
 
-test_vault_injection_names_only_the_secret() {
-  local dir out
-  dir="$TMP_ROOT/vault"
+# make_fake_av <dir>: stands in for Automic Vault executing the launcher's
+# shebang, `av inject +BITBUCKET_ACCESS_TOKEN /bin/sh <launcher> ...`.
+make_fake_av() {
+  local dir=$1
   mkdir -p "$dir/fakebin"
-  make_fake_curl "$dir"
-  printf '%s\n' '{"uuid":"{repository}"}' > "$dir/response.json"
   cat > "$dir/fakebin/av" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_AV_LOG"
 [ "${1:-}" = inject ] || exit 92
 [ "${2:-}" = +BITBUCKET_ACCESS_TOKEN ] || exit 93
-[ "${3:-}" = -- ] || exit 94
-shift 3
+[ "${3:-}" = /bin/sh ] || exit 94
+shift 2
 BITBUCKET_ACCESS_TOKEN="$FM_TEST_EXPECT_TOKEN" exec "$@"
 SH
   chmod +x "$dir/fakebin/av"
+}
 
-  out=$(FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' run_api "$dir" GET \
+test_vault_injection_names_only_the_secret() {
+  local dir out
+  dir="$TMP_ROOT/vault"
+  mkdir -p "$dir/home"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  printf '%s\n' '{"uuid":"{repository}"}' > "$dir/response.json"
+
+  out=$(FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' run_api "$dir" GET \
     /2.0/repositories/workspace/repository)
 
   assert_contains "$out" '"uuid":"{repository}"' "vault token: API response was not relayed"
-  assert_contains "$(cat "$dir/av.log")" 'inject +BITBUCKET_ACCESS_TOKEN -- ' \
-    "vault token: API helper did not use the named Automic Vault secret"
+  assert_equals "$(cat "$dir/av.log")" \
+    "inject +BITBUCKET_ACCESS_TOKEN /bin/sh $LAUNCHER GET /2.0/repositories/workspace/repository" \
+    "vault token: API helper did not route Automic Vault through the blessable launcher"
   assert_no_grep "$TOKEN" "$dir/av.log" "vault token: credential leaked into Automic Vault arguments"
   assert_not_contains "$(cat "$dir/curl.args")" "$TOKEN" \
     "vault token: credential leaked into curl process arguments"
-  pass "Bitbucket API obtains the named token through Automic Vault without exposing its value"
+  pass "Bitbucket API obtains the named token through the blessable launcher without exposing its value"
 }
 
-test_api_transport_is_read_only_and_rejects_fragments() {
-  local dir rc
-  dir="$TMP_ROOT/read-only-api"
+test_environment_and_home_env_win_over_vault() {
+  local dir out
+  dir="$TMP_ROOT/source-precedence"
+  mkdir -p "$dir/home"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  printf '%s\n' '{"state":"OPEN"}' > "$dir/response.json"
+
+  out=$(FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN="$TOKEN" run_api "$dir" GET \
+    /2.0/repositories/workspace/repository/pullrequests/7)
+  assert_contains "$out" '"state":"OPEN"' "ambient precedence: API response was not relayed"
+  assert_absent "$dir/av.log" "ambient precedence: an environment token still asked Automic Vault"
+
+  printf '%s\n' "BITBUCKET_ACCESS_TOKEN=$TOKEN" > "$dir/home/.env"
+  out=$(FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' run_api "$dir" GET \
+    /2.0/repositories/workspace/repository/pullrequests/7)
+  assert_contains "$out" '"state":"OPEN"' "home .env precedence: API response was not relayed"
+  assert_absent "$dir/av.log" "home .env precedence: a local token still asked Automic Vault"
+  pass "environment and home .env tokens win over the Automic Vault launcher"
+}
+
+test_pull_request_creation_posts_only_the_body_file() {
+  local dir out config
+  dir="$TMP_ROOT/pr-create"
+  mkdir -p "$dir/home"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  printf '%s\n' '{"title":"t","source":{"branch":{"name":"fm/x"}}}' > "$dir/body.json"
+  printf '%s\n' '{"id":15,"links":{"html":{"href":"https://bitbucket.org/workspace/repository/pull-requests/15"}}}' \
+    > "$dir/response.json"
+
+  out=$(FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' run_api "$dir" POST \
+    /2.0/repositories/workspace/repository/pullrequests "$dir/body.json")
+
+  assert_contains "$out" '"id":15' "pull-request creation: API response was not relayed"
+  config=$(cat "$dir/curl.config")
+  assert_contains "$config" 'request = "POST"' "pull-request creation: request was not a POST"
+  assert_contains "$config" 'url = "https://api.bitbucket.org/2.0/repositories/workspace/repository/pullrequests"' \
+    "pull-request creation: request left the fixed pull-request collection"
+  assert_contains "$config" "data-binary = \"@$dir/body.json\"" \
+    "pull-request creation: body file was not sent as the request body"
+  assert_contains "$config" 'header = "Content-Type: application/json"' \
+    "pull-request creation: JSON content type was not declared"
+  assert_no_grep "$TOKEN" "$dir/av.log" "pull-request creation: credential leaked into Automic Vault arguments"
+  assert_not_contains "$(cat "$dir/curl.args")" "$TOKEN" \
+    "pull-request creation: credential leaked into curl process arguments"
+  pass "Bitbucket pull-request creation posts only the validated body file through the launcher"
+}
+
+test_invalid_requests_refuse_before_vault_or_curl() {
+  local dir rc case_name
+  dir="$TMP_ROOT/invalid-requests"
+  mkdir -p "$dir/home"
+  make_fake_curl "$dir"
+  make_fake_av "$dir"
+  printf '%s\n' '{}' > "$dir/response.json" "$dir/body.json"
+  ln -s "$dir/body.json" "$dir/body-link.json"
+  head -c 1048577 /dev/zero > "$dir/large.json"
+  printf '%s\n' '{}' > "$dir/quote\"body.json"
+
+  while IFS='|' read -r case_name method path body; do
+    set +e
+    if [ -n "$body" ]; then
+      FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+        run_api "$dir" "$method" "$path" "$body" > "$dir/stdout" 2> "$dir/stderr"
+    else
+      FM_HOME="$dir/home" FM_TEST_AV_LOG="$dir/av.log" BITBUCKET_ACCESS_TOKEN='' \
+        run_api "$dir" "$method" "$path" > "$dir/stdout" 2> "$dir/stderr"
+    fi
+    rc=$?
+    set -e
+    [ "$rc" -eq 2 ] || fail "invalid request ($case_name) exited $rc instead of 2"
+    assert_absent "$dir/av.log" "invalid request ($case_name) still asked Automic Vault"
+    assert_absent "$dir/curl.args" "invalid request ($case_name) still invoked curl"
+  done <<CASES
+merge write|POST|/2.0/repositories/workspace/repository/pullrequests/7/merge|$dir/body.json
+pull-request update|POST|/2.0/repositories/workspace/repository/pullrequests/7|$dir/body.json
+other collection|POST|/2.0/repositories/workspace/repository/issues|$dir/body.json
+dot workspace|POST|/2.0/repositories/../repository/pullrequests|$dir/body.json
+nested repository|POST|/2.0/repositories/workspace/a/b/pullrequests|$dir/body.json
+missing body|POST|/2.0/repositories/workspace/repository/pullrequests|
+absent body|POST|/2.0/repositories/workspace/repository/pullrequests|$dir/absent.json
+symlink body|POST|/2.0/repositories/workspace/repository/pullrequests|$dir/body-link.json
+oversize body|POST|/2.0/repositories/workspace/repository/pullrequests|$dir/large.json
+quoted body path|POST|/2.0/repositories/workspace/repository/pullrequests|$dir/quote"body.json
+other method|DELETE|/2.0/repositories/workspace/repository/pullrequests/7|
+relative path|GET|user|
+fragment|GET|/2.0/repositories/workspace/repository#fragment|
+GET with body|GET|/2.0/repositories/workspace/repository|$dir/body.json
+launcher flag|--check|GET|/2.0/user
+CASES
+  pass "Bitbucket API refuses invalid requests before any Automic Vault approval or network call"
+}
+
+test_launcher_check_and_stdin_modes_keep_the_token_private() {
+  local dir out rc
+  dir="$TMP_ROOT/launcher-modes"
   mkdir -p "$dir"
   make_fake_curl "$dir"
-  printf '%s\n' '{}' > "$dir/response.json"
+  printf '%s\n' '{"state":"OPEN"}' > "$dir/response.json"
+
+  PATH="$dir/fakebin:$BASE_PATH" FM_TEST_CURL_ARGS="$dir/curl.args" \
+    /bin/sh "$LAUNCHER" --check GET /2.0/user < /dev/null \
+    || fail "launcher check refused a valid read"
+  assert_absent "$dir/curl.args" "launcher check invoked curl"
+
+  out=$(printf '%s\n' "$TOKEN" | FM_BB_TOKEN=inherited-not-a-secret \
+    FM_TEST_CURL_ARGS="$dir/curl.args" FM_TEST_CURL_CONFIG="$dir/curl.config" \
+    FM_TEST_CURL_RESPONSE="$dir/response.json" FM_TEST_EXPECT_TOKEN="$TOKEN" \
+    PATH="$dir/fakebin:$BASE_PATH" /bin/sh "$LAUNCHER" --token-stdin GET /2.0/user)
+  assert_contains "$out" '"state":"OPEN"' "launcher stdin token: API response was not relayed"
+  assert_not_contains "$(cat "$dir/curl.args")" "$TOKEN" \
+    "launcher stdin token: credential leaked into curl process arguments"
 
   set +e
-  BITBUCKET_ACCESS_TOKEN="$TOKEN" run_api "$dir" POST \
-    /2.0/repositories/workspace/repository/pullrequests/7 > "$dir/stdout" 2> "$dir/stderr"
+  printf 'bad token\n' | FM_TEST_CURL_ARGS="$dir/unsafe.args" PATH="$dir/fakebin:$BASE_PATH" \
+    /bin/sh "$LAUNCHER" --token-stdin GET /2.0/user > /dev/null 2> "$dir/stderr"
   rc=$?
   set -e
-  [ "$rc" -eq 2 ] || fail "Bitbucket API transport accepted a write method"
-  [ ! -e "$dir/curl.args" ] || fail "read-only Bitbucket API refusal still invoked curl"
+  [ "$rc" -eq 1 ] || fail "launcher accepted an unsafe token value (exit $rc)"
+  assert_absent "$dir/unsafe.args" "launcher sent an unsafe token value to curl"
+  assert_no_grep 'bad token' "$dir/stderr" "launcher echoed the refused token value"
 
   set +e
-  BITBUCKET_ACCESS_TOKEN="$TOKEN" run_api "$dir" GET \
-    '/2.0/repositories/workspace/repository#fragment' > "$dir/stdout" 2> "$dir/stderr"
+  BITBUCKET_ACCESS_TOKEN='' FM_TEST_CURL_ARGS="$dir/empty.args" PATH="$dir/fakebin:$BASE_PATH" \
+    /bin/sh "$LAUNCHER" GET /2.0/user > /dev/null 2> "$dir/stderr"
   rc=$?
   set -e
-  [ "$rc" -eq 2 ] || fail "Bitbucket API transport accepted a URL fragment"
-  [ ! -e "$dir/curl.args" ] || fail "fragment refusal still invoked curl"
-  pass "Bitbucket API transport exposes only fixed-host reads"
+  [ "$rc" -eq 1 ] || fail "launcher ran without a Vault-supplied token (exit $rc)"
+  assert_absent "$dir/empty.args" "launcher invoked curl without a token"
+  pass "Bitbucket launcher validates without a token and keeps stdin tokens out of curl's arguments and environment"
 }
 
 test_forge_detection_uses_exact_hosts() {
@@ -465,7 +585,10 @@ test_stable_green_merge_preserves_exact_head_invariant() {
 test_ambient_token_never_enters_curl_arguments
 test_home_env_token_never_enters_arguments
 test_vault_injection_names_only_the_secret
-test_api_transport_is_read_only_and_rejects_fragments
+test_environment_and_home_env_win_over_vault
+test_pull_request_creation_posts_only_the_body_file
+test_invalid_requests_refuse_before_vault_or_curl
+test_launcher_check_and_stdin_modes_keep_the_token_private
 test_forge_detection_uses_exact_hosts
 test_url_parser_accepts_only_canonical_bitbucket_pull_requests
 test_poll_emits_only_exact_merged_state
