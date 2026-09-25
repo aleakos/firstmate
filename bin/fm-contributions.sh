@@ -46,11 +46,15 @@
 # to every owner without another forge read. When the budget runs out
 # mid-observation, the poll ends with that URL's records untouched; only a
 # genuine forge failure or head change records an error.
-# API failure leaves error evidence; an expired or absent observation is not
-# silence. FM_CONTRIBUTIONS_MAX_AGE (default 900 seconds) bounds freshness.
+# A Bitbucket read that hits the five-second cap is retried once for up to ten
+# seconds inside the budget, because each one waits on its own Automic Vault
+# authorization; a retry the budget cuts short leaves the observation unmeasured.
+# API failure leaves error evidence naming each failed read and its cause (its
+# timeout, or exit status and first stderr line); an expired or absent
+# observation is not silence. FM_CONTRIBUTIONS_MAX_AGE (default 900 seconds) bounds freshness.
 # A URL whose last good observation is merged or closed is final: it is
 # never re-read, stays fresh, and a stale error beside it is cleared once.
-# A genuine failure prints its unavailable line only when it starts an episode
+# A genuine failure prints its unavailable line, with that cause, only when it starts an episode
 # (no prior owner has an error); a successful read ends the episode.
 # FM_CONTRIBUTIONS_NOW supplies an ISO UTC clock for tests, otherwise UTC now.
 # FM_CONTRIBUTIONS_READY_LABEL selects the equivalent triage label, default
@@ -183,49 +187,89 @@ write_record() { # task record-json-file
   mv -f -- "$staged" "$file"
 }
 
-forge() {
-  local remaining bounded=0 rc=0 forge_err=${FORGE_ERR:-$TMP/forge.err}
-  remaining=$((DEADLINE - $(date +%s)))
-  # The budget, not the forge, refused this read.
-  [ "$remaining" -gt 0 ] || { BUDGET_EXHAUSTED=1; : > "$TMP/budget-exhausted"; return 1; }
-  if [ "$remaining" -le 5 ]; then bounded=1; else remaining=5; fi
-  fm_run_timed "$remaining" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
-    gh "$@" 2> "$forge_err" || rc=$?
-  # A read killed at the budget's own deadline is budget exhaustion too.
-  if [ "$rc" -eq 124 ] && [ "$bounded" -eq 1 ]; then
-    BUDGET_EXHAUSTED=1
-    : > "$TMP/budget-exhausted"
-  elif [ "$rc" -ne 0 ]; then
-    : > "$TMP/forge-unavailable"
-  fi
+# bounded_read <label> <retry-cap> <command...> runs one forge read under the
+# five-second read cap and the poll budget. A read that hits the cap is retried
+# once under <retry-cap> seconds when that is not 0. A failed read leaves
+# "<label> read <cause>" in failed.<label> for the durable error.
+bounded_read() {
+  local label=$1 retry=$2 cap=5 remaining bounded rc cause='' err
+  shift 2
+  err=$TMP/$label.err
+  while :; do
+    remaining=$((DEADLINE - $(date +%s)))
+    # The budget, not the forge, refused this read.
+    [ "$remaining" -gt 0 ] || { BUDGET_EXHAUSTED=1; : > "$TMP/budget-exhausted"; return 1; }
+    bounded=0
+    if [ "$remaining" -le "$cap" ]; then bounded=1; else remaining=$cap; fi
+    rc=0
+    fm_run_timed "$remaining" "$@" 2> "$err" || rc=$?
+    [ "$rc" -ne 0 ] || return 0
+    # A read killed at the budget's own deadline is budget exhaustion too.
+    if [ "$rc" -eq 124 ] && [ "$bounded" -eq 1 ]; then
+      BUDGET_EXHAUSTED=1
+      : > "$TMP/budget-exhausted"
+      return "$rc"
+    fi
+    if [ "$rc" -eq 124 ]; then
+      cause="${cause}timed out after ${remaining}s"
+    else
+      cause="${cause}exited $rc"
+      [ ! -s "$err" ] || cause="$cause: $(head -n 1 "$err" | LC_ALL=C tr -d '[:cntrl:]' | cut -c 1-200)"
+    fi
+    [ "$rc" -eq 124 ] && [ "$retry" -gt 0 ] || break
+    cap=$retry
+    retry=0
+    cause="$cause, retry "
+  done
+  printf '%s read %s\n' "$label" "$cause" > "$TMP/failed.$label"
+  : > "$TMP/forge-unavailable"
   return "$rc"
 }
 
-bitbucket_read() { # command... -> one Bitbucket read under the read and poll budgets
-  local remaining bounded=0 rc=0 forge_err=${FORGE_ERR:-$TMP/forge.err}
-  remaining=$((DEADLINE - $(date +%s)))
-  [ "$remaining" -gt 0 ] || { BUDGET_EXHAUSTED=1; : > "$TMP/budget-exhausted"; return 1; }
-  if [ "$remaining" -le 5 ]; then bounded=1; else remaining=5; fi
-  fm_run_timed "$remaining" "$@" 2> "$forge_err" || rc=$?
-  if [ "$rc" -eq 124 ] && [ "$bounded" -eq 1 ]; then
-    BUDGET_EXHAUSTED=1
-    : > "$TMP/budget-exhausted"
-  elif [ "$rc" -ne 0 ]; then
-    : > "$TMP/forge-unavailable"
-  fi
-  return "$rc"
+forge() { # label gh-arguments...
+  local label=$1
+  shift
+  bounded_read "$label" 0 env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh "$@"
 }
 
-bitbucket_forge() { # relative API path
-  bitbucket_read "$SCRIPT_DIR/fm-bitbucket-api.sh" GET "$1"
+# Every Bitbucket read is its own Automic Vault authorization. Under host load
+# that authorization alone has been measured at 7-13 seconds while the request
+# itself takes under one, so a read that hits the cap gets one longer retry.
+bitbucket_read() { # label command...
+  local label=$1
+  shift
+  bounded_read "$label" 10 "$@"
+}
+
+bitbucket_forge() { # label relative-API-path
+  bitbucket_read "$1" "$SCRIPT_DIR/fm-bitbucket-api.sh" GET "$2"
 }
 
 # Bitbucket abbreviates a pull request's source.commit.hash; the shared
 # fm_pr_bitbucket_resolve_head canonicalizes it, run as one bounded read.
-bitbucket_head() { # workspace repository hash -> full head hash
-  if fm_pr_head_valid "$3"; then printf '%s\n' "$3"; return 0; fi
-  bitbucket_read bash -c '. "$1/fm-pr-lib.sh" && fm_pr_bitbucket_resolve_head "$2" "$3" "$4"' \
-    fm-contributions "$SCRIPT_DIR" "$@"
+bitbucket_head() { # label workspace repository hash -> full head hash
+  if fm_pr_head_valid "$4"; then printf '%s\n' "$4"; return 0; fi
+  bitbucket_read "$1" bash -c '. "$1/fm-pr-lib.sh" && fm_pr_bitbucket_resolve_head "$2" "$3" "$4"' \
+    fm-contributions "$SCRIPT_DIR" "$2" "$3" "$4"
+}
+
+# unavailable <cause> records why an observation failed outside a single read.
+unavailable() {
+  [ -e "$TMP/failure" ] || printf '%s\n' "$*" > "$TMP/failure"
+  return 1
+}
+
+# failure_cause prints every failed read, or else the recorded failure.
+failure_cause() {
+  local file causes=''
+  for file in "$TMP"/failed.*; do
+    [ -f "$file" ] || continue
+    causes="${causes:+$causes; }$(cat "$file")"
+  done
+  if [ -n "$causes" ]; then printf '%s\n' "$causes"
+  elif [ -f "$TMP/failure" ]; then cat "$TMP/failure"
+  else printf 'observation failed without a recorded cause\n'
+  fi
 }
 
 wait_forges() { # background forge pids from one independent read wave
@@ -240,38 +284,40 @@ wait_forges() { # background forge pids from one independent read wave
 }
 
 observe_bitbucket() { # canonical Bitbucket Cloud PR URL -> normalized JSON
-  local url=$1 workspace repo number api_path head_raw head after_raw after
-  fm_pr_url_parse "$url" && [ "$FM_PR_PROVIDER" = bitbucket ] || return 1
+  local url=$1 workspace repo number api_path head_raw head after_raw after page
+  fm_pr_url_parse "$url" && [ "$FM_PR_PROVIDER" = bitbucket ] || unavailable 'unsupported Bitbucket URL' || return
   workspace=$FM_PR_OWNER
   repo=$FM_PR_REPO
   number=$FM_PR_NUMBER
-  api_path=$(fm_pr_bitbucket_api_path "$workspace" "$repo" "$number") || return 1
-  rm -f -- "$TMP/budget-exhausted" "$TMP/forge-unavailable"
-  bitbucket_forge "$api_path" > "$TMP/core.json" || return 1
+  api_path=$(fm_pr_bitbucket_api_path "$workspace" "$repo" "$number") || unavailable 'unsupported Bitbucket URL' || return
+  bitbucket_forge core "$api_path" > "$TMP/core.json" || return 1
   head_raw=$(jq -er --argjson number "$number" '
     select(type == "object" and .id == $number and (.state | IN("OPEN","MERGED","DECLINED","SUPERSEDED"))
       and (.draft | type) == "boolean" and (.source.commit.hash | type) == "string")
-    | .source.commit.hash' "$TMP/core.json") || return 1
+    | .source.commit.hash' "$TMP/core.json") || unavailable 'core read returned no recognizable pull request' || return
   # Head resolution depends only on the core read, so it joins the independent wave.
-  FORGE_ERR="$TMP/head.err" bitbucket_head "$workspace" "$repo" "$head_raw" > "$TMP/head" &
+  bitbucket_head head "$workspace" "$repo" "$head_raw" > "$TMP/head" &
   local head_pid=$!
-  FORGE_ERR="$TMP/comments.err" bitbucket_forge "$api_path/comments?pagelen=100" > "$TMP/comments.json" &
+  bitbucket_forge comments "$api_path/comments?pagelen=100" > "$TMP/comments.json" &
   local comments_pid=$!
-  FORGE_ERR="$TMP/statuses.err" bitbucket_forge "$api_path/statuses?pagelen=100" > "$TMP/statuses.json" &
+  bitbucket_forge statuses "$api_path/statuses?pagelen=100" > "$TMP/statuses.json" &
   local statuses_pid=$!
   wait_forges "$head_pid" "$comments_pid" "$statuses_pid" || return 1
   head=$(cat "$TMP/head")
-  fm_pr_head_valid "$head" || return 1
-  jq -e 'type == "object" and (.values | type) == "array" and (.next // null) == null' \
-    "$TMP/comments.json" "$TMP/statuses.json" >/dev/null || return 1
-  bitbucket_forge "$api_path" > "$TMP/after.json" || return 1
-  after_raw=$(jq -er '.source.commit.hash | strings' "$TMP/after.json") || return 1
+  fm_pr_head_valid "$head" || unavailable 'head read returned no full commit hash' || return
+  for page in comments statuses; do
+    jq -e 'type == "object" and (.values | type) == "array" and (.next // null) == null' \
+      "$TMP/$page.json" >/dev/null || unavailable "$page read returned no single complete page" || return
+  done
+  bitbucket_forge after "$api_path" > "$TMP/after.json" || return 1
+  after_raw=$(jq -er '.source.commit.hash | strings' "$TMP/after.json") \
+    || unavailable 'after read returned no source commit' || return
   if [ "$after_raw" = "$head_raw" ]; then
     after=$head
   else
-    after=$(bitbucket_head "$workspace" "$repo" "$after_raw") || return 1
+    after=$(bitbucket_head after-head "$workspace" "$repo" "$after_raw") || return 1
   fi
-  [ "$head" = "$after" ] || { printf 'head changed during observation\n' > "$TMP/forge.err"; return 1; }
+  [ "$head" = "$after" ] || unavailable 'head changed during observation' || return
   jq -n --arg head "$head" --slurpfile core "$TMP/core.json" --slurpfile comments "$TMP/comments.json" \
     --slurpfile statuses "$TMP/statuses.json" '
     $core[0] as $c
@@ -303,42 +349,45 @@ observe_bitbucket() { # canonical Bitbucket Cloud PR URL -> normalized JSON
          | {token:("comment:" + (.id|tostring) + ":" + (.updated_on // .created_on // "")),
             type:"comment",source:(.links.html.href // $c.links.html.href),head:null,
             author:(.user.nickname // .user.display_name // .user.uuid),body:(.content.raw // "" | .[:500])}]}' \
-    > "$TMP/observation.json" || return 1
+    > "$TMP/observation.json" || unavailable 'reads could not be normalized into one observation' || return
   jq_lib -ne --arg url "$url" --slurpfile observed "$TMP/observation.json" '
     {schema:"fm-contributions.v1",task:"observation",records:[{url:$url,kind:"pr",pending:[],seen:[],observation:$observed[0]}]}
-    | valid_record' >/dev/null
+    | valid_record' >/dev/null || unavailable 'normalized observation failed validation'
 }
 
 observe() { # canonical supported URL -> normalized JSON
   local url=$1 part number kind endpoint head after label
+  rm -f -- "$TMP/budget-exhausted" "$TMP/forge-unavailable" "$TMP/failure" "$TMP"/failed.*
   case "$url" in
     https://bitbucket.org/*) observe_bitbucket "$url"; return ;;
   esac
-  case "$url" in https://github.com/*) ;; *) return 1 ;; esac
+  case "$url" in https://github.com/*) ;; *) unavailable 'unsupported forge URL'; return ;; esac
   part=${url#https://github.com/}; number=${part##*/}; part=${part%/*}; kind=${part##*/}; part=${part%/*}
-  case "$kind" in pull) endpoint="repos/$part/pulls/$number" ;; issues) endpoint="repos/$part/issues/$number" ;; *) return 1 ;; esac
-  rm -f -- "$TMP/budget-exhausted" "$TMP/forge-unavailable"
-  forge api "$endpoint" > "$TMP/core.json" || return 1
-  jq -e '(.state == "open" or .state == "closed") and (.user.login | type == "string")' "$TMP/core.json" >/dev/null || return 1
+  case "$kind" in pull) endpoint="repos/$part/pulls/$number" ;; issues) endpoint="repos/$part/issues/$number" ;; *) unavailable 'unsupported GitHub URL'; return ;; esac
+  forge core api "$endpoint" > "$TMP/core.json" || return 1
+  jq -e '(.state == "open" or .state == "closed") and (.user.login | type == "string")' "$TMP/core.json" >/dev/null \
+    || unavailable "core read returned no recognizable $kind" || return
   if [ "$kind" = pull ]; then
-    head=$(jq -er '.head.sha | select(test("^[a-fA-F0-9]{40}$"))' "$TMP/core.json") || return 1
-    FORGE_ERR="$TMP/comments.err" forge api "repos/$part/issues/$number/comments?per_page=100" --paginate --slurp > "$TMP/comments.json" &
+    head=$(jq -er '.head.sha | select(test("^[a-fA-F0-9]{40}$"))' "$TMP/core.json") \
+      || unavailable 'core read returned no full head commit' || return
+    forge comments api "repos/$part/issues/$number/comments?per_page=100" --paginate --slurp > "$TMP/comments.json" &
     local comments_pid=$!
-    FORGE_ERR="$TMP/reviews.err" forge api "$endpoint/reviews?per_page=100" --paginate --slurp > "$TMP/reviews.json" &
+    forge reviews api "$endpoint/reviews?per_page=100" --paginate --slurp > "$TMP/reviews.json" &
     local reviews_pid=$!
-    FORGE_ERR="$TMP/inline.err" forge api "$endpoint/comments?per_page=100" --paginate --slurp > "$TMP/inline.json" &
+    forge inline api "$endpoint/comments?per_page=100" --paginate --slurp > "$TMP/inline.json" &
     local inline_pid=$!
-    FORGE_ERR="$TMP/checks.err" forge api "repos/$part/commits/$head/check-runs?filter=all&per_page=100" --paginate --slurp > "$TMP/checks.json" &
+    forge checks api "repos/$part/commits/$head/check-runs?filter=all&per_page=100" --paginate --slurp > "$TMP/checks.json" &
     local checks_pid=$!
-    FORGE_ERR="$TMP/statuses.err" forge api "repos/$part/commits/$head/statuses?per_page=100" --paginate --slurp > "$TMP/statuses.json" &
+    forge statuses api "repos/$part/commits/$head/statuses?per_page=100" --paginate --slurp > "$TMP/statuses.json" &
     local statuses_pid=$!
-    FORGE_ERR="$TMP/repo.err" forge api "repos/$part" > "$TMP/repo.json" &
+    forge repo api "repos/$part" > "$TMP/repo.json" &
     local repo_pid=$!
     wait_forges "$comments_pid" "$reviews_pid" "$inline_pid" "$checks_pid" "$statuses_pid" "$repo_pid" || return 1
-    jq -e 'type == "array" and all(.[]; type == "array")' "$TMP/comments.json" >/dev/null || return 1
-    forge pr view "$url" --json headRefOid,reviewDecision > "$TMP/after.json" || return 1
-    after=$(jq -er .headRefOid "$TMP/after.json")
-    [ "$head" = "$after" ] || { printf 'head changed during observation\n' > "$TMP/forge.err"; return 1; }
+    jq -e 'type == "array" and all(.[]; type == "array")' "$TMP/comments.json" >/dev/null \
+      || unavailable 'comments read returned no pages' || return
+    forge after pr view "$url" --json headRefOid,reviewDecision > "$TMP/after.json" || return 1
+    after=$(jq -er .headRefOid "$TMP/after.json") || unavailable 'after read returned no head commit' || return
+    [ "$head" = "$after" ] || unavailable 'head changed during observation' || return
     jq -n --slurpfile core "$TMP/core.json" --slurpfile comments "$TMP/comments.json" \
       --slurpfile reviews "$TMP/reviews.json" --slurpfile inline "$TMP/inline.json" --slurpfile after "$TMP/after.json" --slurpfile checks "$TMP/checks.json" \
       --slurpfile statuses "$TMP/statuses.json" --slurpfile repo "$TMP/repo.json" '
@@ -357,15 +406,17 @@ observe() { # canonical supported URL -> normalized JSON
             | map(select(.user.login != $c.user.login and (.author_association | IN("OWNER","MEMBER","COLLABORATOR")))
               | {token:((._signal + ":") + (.id|tostring) + ":" + (.updated_at // .submitted_at // "") + ":" + (.state // "")),
                  type:._signal,source:.html_url,head:.commit_id,
-                 author:.user.login,body:(.body // "" | .[:500])}))}' > "$TMP/observation.json" || return 1
+                 author:.user.login,body:(.body // "" | .[:500])}))}' > "$TMP/observation.json" \
+      || unavailable 'reads could not be normalized into one observation' || return
   else
     label=${FM_CONTRIBUTIONS_READY_LABEL:-ready-for-pr}
-    FORGE_ERR="$TMP/comments.err" forge api "repos/$part/issues/$number/comments?per_page=100" --paginate --slurp > "$TMP/comments.json" &
+    forge comments api "repos/$part/issues/$number/comments?per_page=100" --paginate --slurp > "$TMP/comments.json" &
     local comments_pid=$!
-    FORGE_ERR="$TMP/issue-events.err" forge api "repos/$part/issues/$number/events?per_page=100" --paginate --slurp > "$TMP/issue-events.json" &
+    forge events api "repos/$part/issues/$number/events?per_page=100" --paginate --slurp > "$TMP/issue-events.json" &
     local events_pid=$!
     wait_forges "$comments_pid" "$events_pid" || return 1
-    jq -e 'type == "array" and all(.[]; type == "array")' "$TMP/comments.json" >/dev/null || return 1
+    jq -e 'type == "array" and all(.[]; type == "array")' "$TMP/comments.json" >/dev/null \
+      || unavailable 'comments read returned no pages' || return
     jq -n --slurpfile timeline "$TMP/issue-events.json" --arg label "$label" --slurpfile core "$TMP/core.json" --slurpfile comments "$TMP/comments.json" '
       $core[0] as $c | {state:$c.state,head:null,
         ready:any($c.labels[]; (.name | ascii_downcase) == ($label | ascii_downcase)),
@@ -374,12 +425,13 @@ observe() { # canonical supported URL -> normalized JSON
             | {token:("comment:" + (.id|tostring) + ":" + (.updated_at // "")),type:"comment",source:.html_url,
                head:null,author:.user.login,body:(.body // "" | .[:500])})
           + [$timeline[0][] | .[] | select(.event == "labeled" and (.label.name | ascii_downcase) == ($label | ascii_downcase))
-             | {token:("ready-for-pr:" + (.id | tostring)),type:"ready-for-pr",source:$c.html_url,head:null,body:"filed issue reached ready-for-pr"}])}' > "$TMP/observation.json" || return 1
+             | {token:("ready-for-pr:" + (.id | tostring)),type:"ready-for-pr",source:$c.html_url,head:null,body:"filed issue reached ready-for-pr"}])}' > "$TMP/observation.json" \
+      || unavailable 'reads could not be normalized into one observation' || return
   fi
   jq_lib -ne --arg url "$url" --arg kind "$kind" --slurpfile observed "$TMP/observation.json" '
     {schema:"fm-contributions.v1",task:"observation",records:[{url:$url,
       kind:(if $kind == "pull" then "pr" else "issue" end),pending:[],seen:[],observation:$observed[0]}]}
-    | valid_record' >/dev/null
+    | valid_record' >/dev/null || unavailable 'normalized observation failed validation'
 }
 
 publish_pending() { # task canonical-url record-file
@@ -462,7 +514,7 @@ poll() {
     if [ "$observed" -ne 0 ] && jq -ne --slurpfile saved "$TMP/saved.json" --arg url "$url" --args \
       'all($ARGS.positional[] as $task | [$saved[0][] | select(.task == $task) | .records[] | select(.url == $url)] | first;
         .error == null)' "${row[@]:1}" >/dev/null; then
-      printf 'contributions: observation unavailable for %s\n' "$url"
+      printf 'contributions: observation unavailable for %s: %s\n' "$url" "$(failure_cause)"
     fi
     case "$url" in */issues/*) kind=issue ;; *) kind="pr" ;; esac
     for task in "${row[@]:1}"; do
@@ -482,7 +534,7 @@ poll() {
             seen:($events | map(.token)),
             pending:(($old.pending // []) + [$events[] | select(.token as $t | ($old.seen // [] | index($t)) == null)] | unique_by(.token))}' > "$TMP/row.json"
       else
-        error='forge observation unavailable or changed during read'
+        error="forge observation unavailable: $(failure_cause)"
         jq --arg now "$NOW" --arg error "$error" '.checked_at=$now | .error=$error' "$old" > "$TMP/row.json"
       fi
       write_record "$task" "$TMP/row.json"

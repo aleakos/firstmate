@@ -171,6 +171,10 @@ bitbucket_forge_home() { # home [pull-request source hash] [pull-request state]
 #!/usr/bin/env bash
 config=\$(cat)
 printf 'call\n' >> "$home/forge/calls"
+case "\$(cat "$home/forge/fault" 2>/dev/null):\$config" in
+  statuses-403:*'/statuses?'*)
+    printf 'curl: (22) The requested URL returned error: 403\n' >&2; exit 22 ;;
+esac
 case "\$config" in
   *'/pullrequests/12/comments?pagelen=100'*)
     printf '%s\n' '{"values":[{"id":9,"deleted":false,"user":{"uuid":"{reviewer}","nickname":"maintainer"},"updated_on":"2026-09-16T08:01:00Z","content":{"raw":"Please adjust this"},"links":{"html":{"href":"https://bitbucket.org/workspace/repository/pull-requests/12#comment-9"}}}],"next":null}' ;;
@@ -255,6 +259,82 @@ test_bitbucket_terminal_pull_request_settles() {
       || fail "a settled $state Bitbucket record changed: $(cat "$home/data/bitbucket/contributions.json")"
   done
   pass 'a declined, superseded, or merged Bitbucket Cloud pull request settles once, clears its error, and is not re-read'
+}
+
+# slow_vault <home> <stalled>: Automic Vault that stalls its first <stalled>
+# authorizations for FORGE_VAULT_STALL seconds before injecting the token.
+slow_vault() {
+  local home=$1
+  printf '%s\n' "$2" > "$home/forge/stalled"
+  cat > "$home/fakebin/av" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${*: -1}" >> "$FORGE/vault"
+stalled=$(cat "$FORGE/stalled")
+if [ "$stalled" -gt 0 ]; then
+  printf '%s\n' "$((stalled - 1))" > "$FORGE/stalled"
+  sleep "$FORGE_VAULT_STALL"
+fi
+[ "$1 $2" = 'inject +BITBUCKET_ACCESS_TOKEN' ] || exit 92
+shift 2
+BITBUCKET_ACCESS_TOKEN=test-token exec "$@"
+SH
+  chmod +x "$home/fakebin/av"
+}
+
+test_bitbucket_stalled_vault_authorization_is_retried() {
+  local home out core=/2.0/repositories/workspace/repository/pullrequests/12
+  home=$(new_home bitbucket-stalled-vault)
+  bitbucket_forge_home "$home"
+  # The first core read outlives the five-second cap; its retry needs seven.
+  slow_vault "$home" 2
+  out=$(with_home "$home" env -u BITBUCKET_ACCESS_TOKEN FORGE_VAULT_STALL=7 "$ROOT/bin/fm-contributions.sh" poll) \
+    || fail 'poll failed behind a stalled Vault authorization'
+  # The fixture's maintainer comment is the only line a fresh observation prints.
+  ! printf '%s\n' "$out" | grep -qv '^contribution-wake: ' \
+    || fail "a stalled Vault authorization raised an alert: $out"
+  [ "$(grep -cFx "$core" "$home/forge/vault")" = 3 ] \
+    || fail "the stalled core read was not retried exactly once: $(cat "$home/forge/vault")"
+  jq -e --arg now "$NOW" '.records[0] | .checked_at == $now and .error == null
+    and .observation.head == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    "$home/data/bitbucket/contributions.json" >/dev/null \
+    || fail "a retried Bitbucket observation was not fresh: $(cat "$home/data/bitbucket/contributions.json")"
+  pass 'a Bitbucket read stalled past the cap in Vault authorization is retried and observed fresh'
+}
+
+test_bitbucket_vault_stall_past_retry_names_the_read() {
+  local home out cause='core read timed out after 5s, retry timed out after 10s'
+  home=$(new_home bitbucket-vault-outage)
+  bitbucket_forge_home "$home"
+  slow_vault "$home" 2
+  out=$(with_home "$home" env -u BITBUCKET_ACCESS_TOKEN FORGE_VAULT_STALL=30 "$ROOT/bin/fm-contributions.sh" poll) \
+    || fail 'poll failed behind an unresponsive Vault authorization'
+  [ "$out" = "contributions: observation unavailable for https://bitbucket.org/workspace/repository/pull-requests/12: $cause" ] \
+    || fail "an unresponsive Vault authorization did not wake once naming its read: $out"
+  jq -e --arg error "forge observation unavailable: $cause" '.records[0].error == $error' \
+    "$home/data/bitbucket/contributions.json" >/dev/null \
+    || fail "the recorded error did not name the failed read: $(cat "$home/data/bitbucket/contributions.json")"
+  out=$(with_home "$home" env -u BITBUCKET_ACCESS_TOKEN FORGE_VAULT_STALL=30 FM_CONTRIBUTIONS_NOW=2026-09-16T09:00:00Z \
+    "$ROOT/bin/fm-contributions.sh" poll) || fail 'poll after a recovered Vault failed'
+  ! printf '%s\n' "$out" | grep -qv '^contribution-wake: ' || fail "a recovered Vault read printed: $out"
+  jq -e '.records[0].error == null' "$home/data/bitbucket/contributions.json" >/dev/null \
+    || fail 'a successful Bitbucket read did not end the failure episode'
+  pass 'a Bitbucket read still stalled after its retry wakes once naming the read and its timeouts'
+}
+
+test_bitbucket_failed_read_names_its_cause() {
+  local home out cause='statuses read exited 22: curl: (22) The requested URL returned error: 403'
+  home=$(new_home bitbucket-failed-read)
+  bitbucket_forge_home "$home"
+  printf 'statuses-403\n' > "$home/forge/fault"
+  out=$(BITBUCKET_ACCESS_TOKEN=test-token with_home "$home" "$ROOT/bin/fm-contributions.sh" poll) \
+    || fail 'poll failed on a refused Bitbucket read'
+  [ "$out" = "contributions: observation unavailable for https://bitbucket.org/workspace/repository/pull-requests/12: $cause" ] \
+    || fail "a refused Bitbucket read did not name its read and cause: $out"
+  [ "$(grep -c . "$home/forge/calls")" = 3 ] || fail 'a refused Bitbucket read was retried'
+  jq -e --arg error "forge observation unavailable: $cause" '.records[0].error == $error' \
+    "$home/data/bitbucket/contributions.json" >/dev/null \
+    || fail "the recorded error did not name the refused read: $(cat "$home/data/bitbucket/contributions.json")"
+  pass 'a refused Bitbucket read is not retried and its error names the read, exit status, and stderr'
 }
 
 test_incoming_signal() { # comment|review|inline
@@ -713,16 +793,16 @@ test_genuine_failure_near_deadline_is_unavailable() {
   /bin/date +%s > "$home/forge/clock"
   printf 'fail-late\n' > "$home/forge/fault"
   out=$(with_home "$home" "$ROOT/bin/fm-contributions.sh" poll) || fail 'poll failed on a genuine forge failure'
-  [ "$out" = 'contributions: observation unavailable for https://github.com/o/r/pull/8' ] \
-    || fail "a genuine forge failure past the deadline was swallowed: $out"
+  [ "$out" = 'contributions: observation unavailable for https://github.com/o/r/pull/8: reviews read exited 1: HTTP 502' ] \
+    || fail "a genuine forge failure past the deadline was swallowed or unnamed: $out"
   jq -e --arg now "$NOW" '.records[0].checked_at == $now
-    and .records[0].error == "forge observation unavailable or changed during read"' \
+    and .records[0].error == "forge observation unavailable: reviews read exited 1: HTTP 502"' \
     "$home/data/delivery/contributions.json" >/dev/null || fail 'a genuine forge failure left no error evidence'
   pass 'a genuine forge failure inside the budget still records the error and wakes'
 }
 
 test_shared_url_observed_once() {
-  local mode home out calls expected
+  local mode home out calls expected cause
   for mode in ok fail head; do
     home=$(new_home "shared-once-$mode")
     forge_home "$home"
@@ -736,8 +816,10 @@ test_shared_url_observed_once() {
       expected=null
       [ -z "$out" ] || fail "a healthy shared observation printed: $out"
     else
-      expected='"forge observation unavailable or changed during read"'
-      [ "$out" = 'contributions: observation unavailable for https://github.com/o/r/pull/8' ] \
+      cause='reviews read exited 1: HTTP 502'
+      [ "$mode" = fail ] || cause='head changed during observation'
+      expected=$(jq -n --arg cause "$cause" '"forge observation unavailable: " + $cause')
+      [ "$out" = "contributions: observation unavailable for https://github.com/o/r/pull/8: $cause" ] \
         || fail "a shared unavailable observation did not wake exactly once ($mode): $out"
     fi
     for task in delivery duplicate; do
@@ -872,8 +954,8 @@ test_three_second_pr_reads_complete_fresh_in_one_cycle() { # 3-second reads: 8 s
 }
 
 test_unavailable_forge_records_error_and_wakes_once_per_episode() { # genuine outage, two consecutive cycles
-  local home out line='contributions: observation unavailable for https://github.com/o/r/pull/8'
-  local error='"forge observation unavailable or changed during read"'
+  local home out line='contributions: observation unavailable for https://github.com/o/r/pull/8: core read exited 1: HTTP 502'
+  local error='"forge observation unavailable: core read exited 1: HTTP 502"'
   home=$(new_home failure-episode)
   forge_home "$home"
   wrap_forge "$home"
@@ -898,8 +980,8 @@ test_unavailable_forge_records_error_and_wakes_once_per_episode() { # genuine ou
 }
 
 test_late_owner_keeps_failure_episode_suppressed() {
-  local home out line='contributions: observation unavailable for https://github.com/o/r/pull/8'
-  local error='forge observation unavailable or changed during read' task
+  local home out line='contributions: observation unavailable for https://github.com/o/r/pull/8: core read exited 1: HTTP 502'
+  local error='forge observation unavailable: core read exited 1: HTTP 502' task
   home=$(new_home late-owner-failure-episode)
   forge_home "$home"
   wrap_forge "$home"
@@ -931,7 +1013,7 @@ test_late_owner_keeps_failure_episode_suppressed() {
 }
 
 failures=0
-for test_name in test_actor_coverage test_bitbucket_pull_request_observation test_bitbucket_abbreviated_head_observation test_bitbucket_terminal_pull_request_settles test_stale_verdict test_unchecked_is_not_silence test_newest_check_has_no_verdict test_comment_wake test_review_wake test_inline_wake test_ready_issue_wake test_fresh_issue_requires_maintainer test_missing_lane_remains_missing test_partial_freshness_keeps_measured_rows test_malformed_record_cannot_prove_silence test_issue_timeline_and_exact_ack test_verdict_retains_judged_head test_observed_replacement_refreshes_verdict test_unobserved_head_leaves_verdict_unknown test_away_yolo_is_fleet_work test_away_yolo_cross_home_is_fleet_work test_retired_and_unsupported_coverage test_unsupported_forge_is_not_fleet_work test_held_unsupported_forge_is_not_captain_work test_shared_contribution_signal_wakes_once test_watcher_keeps_diagnostics_separate_from_contribution_wakes test_expired_child_unsupported_forge_stays_unmeasured test_watcher_surfaces_new_contribution_once test_home_summary_coverage test_unreadable_pending_is_not_empty test_budget_refusal_between_calls test_budget_bounded_call_timeout test_genuine_failure_near_deadline_is_unavailable test_shared_url_observed_once test_terminal_contribution_settles test_late_owner_inherits_terminal_observation test_done_task_open_pr_still_observed test_reservation_defers_later_url_when_fifteen_seconds_do_not_remain test_three_second_pr_reads_complete_fresh_in_one_cycle test_unavailable_forge_records_error_and_wakes_once_per_episode test_late_owner_keeps_failure_episode_suppressed; do
+for test_name in test_actor_coverage test_bitbucket_pull_request_observation test_bitbucket_abbreviated_head_observation test_bitbucket_terminal_pull_request_settles test_bitbucket_stalled_vault_authorization_is_retried test_bitbucket_vault_stall_past_retry_names_the_read test_bitbucket_failed_read_names_its_cause test_stale_verdict test_unchecked_is_not_silence test_newest_check_has_no_verdict test_comment_wake test_review_wake test_inline_wake test_ready_issue_wake test_fresh_issue_requires_maintainer test_missing_lane_remains_missing test_partial_freshness_keeps_measured_rows test_malformed_record_cannot_prove_silence test_issue_timeline_and_exact_ack test_verdict_retains_judged_head test_observed_replacement_refreshes_verdict test_unobserved_head_leaves_verdict_unknown test_away_yolo_is_fleet_work test_away_yolo_cross_home_is_fleet_work test_retired_and_unsupported_coverage test_unsupported_forge_is_not_fleet_work test_held_unsupported_forge_is_not_captain_work test_shared_contribution_signal_wakes_once test_watcher_keeps_diagnostics_separate_from_contribution_wakes test_expired_child_unsupported_forge_stays_unmeasured test_watcher_surfaces_new_contribution_once test_home_summary_coverage test_unreadable_pending_is_not_empty test_budget_refusal_between_calls test_budget_bounded_call_timeout test_genuine_failure_near_deadline_is_unavailable test_shared_url_observed_once test_terminal_contribution_settles test_late_owner_inherits_terminal_observation test_done_task_open_pr_still_observed test_reservation_defers_later_url_when_fifteen_seconds_do_not_remain test_three_second_pr_reads_complete_fresh_in_one_cycle test_unavailable_forge_records_error_and_wakes_once_per_episode test_late_owner_keeps_failure_episode_suppressed; do
   ( "$test_name" ) || failures=$((failures + 1))
 done
 [ "$failures" -eq 0 ] || fail "$failures contribution regressions"
